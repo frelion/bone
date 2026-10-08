@@ -23,12 +23,18 @@ fn changing_a_model_keeps_endpoint_and_does_not_move_credentials_between_provide
 fn write_preview_describes_proposed_content_without_fabricating_additions() {
     let preview = proposed_change_preview(
         "write_file",
-        &serde_json::json!({"content":"existing replacement\nsecond line"}),
+        &serde_json::json!({"mode":"replace","content":"existing replacement\nsecond line"}),
     );
     assert!(preview.contains("拟写入内容（可能覆盖现有文件）"));
     assert!(preview.contains("```text\nexisting replacement\nsecond line\n```"));
     assert!(!preview.contains("```diff"));
     assert!(!preview.contains("+ existing"));
+    let appended = proposed_change_preview(
+        "write_file",
+        &serde_json::json!({"mode":"append","content":"next fragment"}),
+    );
+    assert!(appended.contains("拟追加到文件末尾"));
+    assert!(!appended.contains("覆盖"));
 }
 
 #[test]
@@ -692,6 +698,44 @@ fn execution_feedback_fixture(
         profile,
     });
     (dir, engine, app, server)
+}
+
+#[tokio::test]
+async fn generation_continuation_is_visible_and_final_pause_keeps_a_specific_reason() {
+    let (dir, mut engine, mut app, _server) = execution_feedback_fixture(serde_json::json!([
+        {"response_status":"incomplete","incomplete_reason":"max_output_tokens","output":[]},
+        {"delay_seconds":0.25,"response_status":"incomplete","incomplete_reason":"max_output_tokens","output":[]}
+    ]));
+    let input = engine.post_message("continue this task").unwrap();
+    let data = dir.path().join("data");
+    let mut saw_continuation = false;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            engine.step().await.unwrap();
+            app.sync(&engine, &data).unwrap();
+            if app.ui.live_status.contains("本轮生成未完成，正在继续") {
+                saw_continuation = true;
+                assert!(app.ui.busy);
+            }
+            if engine.result(&input).is_some() {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(saw_continuation, "the continuation had no running feedback");
+    assert!(app.ui.live_status.contains("已有进度保留"));
+    assert!(!app.ui.busy);
+    let failure = app
+        .ui
+        .messages
+        .iter()
+        .find(|m| matches!(m.kind, MessageKind::Failure))
+        .unwrap();
+    assert!(failure.text.contains("较小动作的续做仍未完成"));
+    assert!(failure.text.contains("原始历史已保留"));
+    assert!(!failure.text.contains("reconcile"));
 }
 
 #[tokio::test]

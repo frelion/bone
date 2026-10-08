@@ -1,6 +1,6 @@
 # BONE 开发终端
 
-BONE 0.10.0 使用 Ratatui、Crossterm、ratatui-textarea 与 tui-markdown。左侧切换会话，右侧写要求、读结果和查看证据。Job 由 Agent 管理。
+BONE 0.10.1 使用 Ratatui、Crossterm、ratatui-textarea 与 tui-markdown。左侧切换会话，右侧写要求、读结果和查看证据。Job 由 Agent 管理。
 
 ## 启动
 
@@ -10,7 +10,7 @@ bone tui --workspace /path/to/project
 bone tui --session SESSION_ID --workspace /path/to/project
 ```
 
-安装：`cargo install --path . --locked --force`。`bone --version` 应显示 `bone 0.10.0`。必须使用交互式终端；管道输入用 `bone chat`。
+安装：`cargo install --path . --locked --force`。`bone --version` 应显示 `bone 0.10.1`。必须使用交互式终端；管道输入用 `bone chat`。
 
 ## 连接与模型
 

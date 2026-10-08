@@ -163,7 +163,13 @@ impl Event {
             if let Some(usage) = data.get("response").and_then(|r| r.get("usage")).cloned() {
                 data.insert("usage".into(), usage);
             }
-            for field in ["message", "response", "stream_items", "covered_ids"] {
+            for field in [
+                "message",
+                "response",
+                "stream_items",
+                "covered_ids",
+                "observations",
+            ] {
                 data.remove(field);
             }
         }

@@ -45,7 +45,7 @@ fn real_runtime_repairs_file_and_persists_owned_effects() {
         "def total(values):\n    return sum(value for value in values if value is not None)\n";
     let fixture = Fixture::turns(json!([
         tool("read_file",json!({"path":"totals.py"}),"call_read"),
-        tool("write_file",json!({"path":"totals.py","content":after,"expected_sha256":format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(before.as_bytes()))}),"call_write"),
+        tool("write_file",json!({"mode":"replace","path":"totals.py","content":after,"expected_sha256":format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(before.as_bytes()))}),"call_write"),
         {"text":"Fixed totals.py and verified empty values and None."}
     ]));
     std::fs::write(fixture.workspace.join("totals.py"), before).unwrap();
@@ -254,7 +254,7 @@ async fn two_jobs_deliver_to_exact_assignment_ids_before_waiter_continues() {
 async fn new_instruction_blocks_unstarted_write_proposals() {
     let mut stale = tool(
         "write_file",
-        json!({"path":"stale.txt","content":"old effects","expected_sha256":null}),
+        json!({"mode":"replace","path":"stale.txt","content":"old effects","expected_sha256":null}),
         "call_stale_write",
     );
     stale["contains"] = json!(["Create stale.txt"]);
@@ -518,7 +518,7 @@ async fn timed_out_partial_write_is_checked_and_followed_by_a_new_write_without_
     inspect["contains"] = json!(["observed-before-timeout"]);
     let mut finish = tool(
         "write_file",
-        json!({"path":"checked.txt","content":"Verified one partial append","expected_sha256":null}),
+        json!({"mode":"replace","path":"checked.txt","content":"Verified one partial append","expected_sha256":null}),
         "call_record_check",
     );
     finish["contains"] = json!(["sha256", "effect.txt"]);
@@ -586,7 +586,7 @@ async fn explicit_stop_drains_the_owned_tool_and_restart_can_inspect_and_write_n
     let fixture = Fixture::turns(json!([
         tool("shell",json!({"command":command,"timeout_seconds":10}),"call_append_once"),
         tool("read_file",json!({"path":"effect.txt"}),"call_inspect_effect"),
-        tool("write_file",json!({"path":"checked.txt","content":"Observed append once","expected_sha256":null}),"call_record_check"),
+        tool("write_file",json!({"mode":"replace","path":"checked.txt","content":"Observed append once","expected_sha256":null}),"call_record_check"),
         {"contains":["Observed append once"],"text":"Observed the interrupted append and completed the check without replay."}
     ]));
     let mut engine = fixture.engine(None, bone::runtime::RunOptions::default());
@@ -705,7 +705,7 @@ fn alternating_ablation_records_all_local_trials_and_usage() {
             json!({"path":"totals.py"}),
             "call_ablate_read",
         ));
-        turns.push(tool("write_file",json!({"path":"totals.py","content":after,"expected_sha256":format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(before.as_bytes()))}),"call_ablate_write"));
+        turns.push(tool("write_file",json!({"mode":"replace","path":"totals.py","content":after,"expected_sha256":format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(before.as_bytes()))}),"call_ablate_write"));
         turns.push(json!({"text":"The repair is complete"}));
     }
     let fixture = Fixture::turns(Value::Array(turns));

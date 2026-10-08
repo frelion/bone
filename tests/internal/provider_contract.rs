@@ -15,8 +15,7 @@ use rig_core::{
 };
 use serde_json::{Value, json};
 
-#[path = "../support/server.rs"]
-mod server;
+use crate::test_server as server;
 struct Fixture {
     _process: server::Server,
     directory: tempfile::TempDir,

@@ -6,6 +6,10 @@ Each turn may require `contains` strings in the request JSON, pause via
 `delay_seconds`, return `http_status`, or provide `output` Responses items.
 Optional `delta_chunk_chars` splits text fragments; `event_delay_seconds`
 or an `event_delays` mapping flushes SSE frames with per-event delays.
+`response_status` and `incomplete_reason` produce native non-success endings;
+`omit_terminal` ends the stream without a response terminal. Output items marked
+`status: in_progress` keep their partial deltas without sending done frames.
+`match_summary` selects work or compaction requests without guessing call order.
 Only request JSON bodies are recorded, never authorization headers.
 """
 
@@ -70,7 +74,9 @@ def expand_output(output, body):
     return replace(output)
 
 
-def response_events(output, number, usage, delta_chunk_chars=0):
+def response_events(output, number, usage, delta_chunk_chars=0,
+                    response_status="completed", incomplete_reason=None,
+                    omit_terminal=False):
     response_id = "resp_fixture_%d" % number
     base = {"id": response_id, "object": "response", "created_at": 1,
             "model": "fixture", "status": "in_progress", "output": []}
@@ -79,6 +85,7 @@ def response_events(output, number, usage, delta_chunk_chars=0):
         item = dict(item)
         item.setdefault("id", "item_fixture_%d_%d" % (number, index))
         item.setdefault("status", "completed")
+        finished = item["status"] == "completed"
         if item["type"] == "function_call" and not isinstance(item.get("arguments", "{}"), str):
             item["arguments"] = json.dumps(item["arguments"])
         if item["type"] == "message":
@@ -99,10 +106,11 @@ def response_events(output, number, usage, delta_chunk_chars=0):
                 "type": "response.function_call_arguments.delta", "item_id": item["id"],
                 "output_index": index, "delta": arguments,
             }
-            yield "response.function_call_arguments.done", {
-                "type": "response.function_call_arguments.done", "item_id": item["id"],
-                "output_index": index, "arguments": arguments,
-            }
+            if finished:
+                yield "response.function_call_arguments.done", {
+                    "type": "response.function_call_arguments.done", "item_id": item["id"],
+                    "output_index": index, "arguments": arguments,
+                }
         elif item["type"] == "message":
             item.setdefault("role", "assistant")
             for content_index, content in enumerate(item.get("content", [])):
@@ -130,12 +138,18 @@ def response_events(output, number, usage, delta_chunk_chars=0):
                     "output_index": index, "content_index": content_index,
                     "part": content,
                 }
-        yield "response.output_item.done", {"type": "response.output_item.done",
-                                             "output_index": index, "item": item}
+        if finished:
+            yield "response.output_item.done", {"type": "response.output_item.done",
+                                                 "output_index": index, "item": item}
         base["output"].append(item)
-    base["status"] = "completed"
+    if omit_terminal:
+        return
+    base["status"] = response_status
     base["usage"] = usage
-    yield "response.completed", {"type": "response.completed", "response": base}
+    if incomplete_reason is not None:
+        base["incomplete_details"] = {"reason": incomplete_reason}
+    terminal = "response.incomplete" if response_status == "incomplete" else "response.completed"
+    yield terminal, {"type": terminal, "response": base}
 
 
 def main():
@@ -169,6 +183,9 @@ def main():
                 for index, candidate in enumerate(turns):
                     if index in state["used"]:
                         continue
+                    summary = body.get("instructions", "").startswith("Summarize this job")
+                    if "match_summary" in candidate and candidate["match_summary"] != summary:
+                        continue
                     selector = candidate.get("match_last_user_contains")
                     if selector is not None and selector not in last_user_text(body):
                         continue
@@ -200,7 +217,9 @@ def main():
                                            "content": [{"type": "output_text", "text": turn.get("text", "done"), "annotations": []}]}])
             output = expand_output(output, body)
             usage = turn.get("usage", {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15})
-            events = list(response_events(output, number, usage, turn.get("delta_chunk_chars", 0)))
+            events = list(response_events(output, number, usage, turn.get("delta_chunk_chars", 0),
+                turn.get("response_status", "completed"), turn.get("incomplete_reason"),
+                turn.get("omit_terminal", False)))
             for sequence, (_name, event) in enumerate(events):
                 event["sequence_number"] = sequence
             streaming = body.get("stream", False)

@@ -1,0 +1,297 @@
+{
+  "experiment": "Fixed protocol ablation of incomplete-generation continuation plus native append",
+  "date": "2026-10-08",
+  "verification_boundary": "Scripted native Rig protocol and actual filesystem/SQLite execution; fixture-reported token counters are synthetic. No evidence of real-model planning, New API production behavior, or commercial cost.",
+  "baseline_commit": "b674fc9edcd51cdcaf3c360aae38a985ccb2f78b",
+  "candidate": "working tree built binary with generation continuation and write_file append",
+  "candidate_source_patch_sha256": "22544160761f63ed9dc869486b0acf7da7537164a00aedd6f13f8d925c3215a8",
+  "binary_sha256": {
+    "baseline": "86b33dd35a81683878333f294a342d825b7ede81d726c9189e3a6458d9ce4cd1",
+    "candidate": "6970454fe423ef3758d7641fb16ad92fffa040fcfd4ee62f632cb1e3cb22f61b"
+  },
+  "fixture_server_sha256": "8f7d43a8fd346cee0963361954cee768830c18d38bed8fe32766245643bdebcc",
+  "fixed_script_sha256": "64185e737deeceec41897d4ada680e692e15526fe1d88234534d01310a9d09c4",
+  "task": "Create generated.txt with a first complete portion and a second complete portion. Verify its result. Never create must-not-exist.txt.",
+  "settings": {
+    "protocol": "OpenAI Responses SSE via native Rig",
+    "model": "fixture",
+    "max_tokens": 8192,
+    "reasoning": {
+      "effort": "low"
+    },
+    "max_calls": 8,
+    "max_jobs": 1,
+    "max_parallel": 1,
+    "single_job": true,
+    "context_chars": 96000,
+    "timeout_seconds": 30,
+    "model_timeout_seconds": 10
+  },
+  "expected_file": {
+    "bytes": 36047,
+    "sha256": "52929738ea5d5f54ba524e6fa7b74707b3c34ef50f7c93a89645f3f3f9173397",
+    "first": {
+      "prefix": "first complete portion\n",
+      "repeat": "same\n",
+      "count": 3600
+    },
+    "last": {
+      "prefix": "second complete portion\n",
+      "repeat": "same\n",
+      "count": 3600
+    }
+  },
+  "response_plan": [
+    "complete-looking replace proposal with response.incomplete/max_output_tokens; must have zero effects",
+    "completed replace first portion",
+    "completed append second portion with first hash",
+    "completed read_file verification",
+    "completed delivery requiring final SHA in request"
+  ],
+  "trials": [
+    {
+      "pair": 1,
+      "variant": "baseline",
+      "pass": false,
+      "acceptance": {
+        "unaccepted_proposal_zero_effects": true,
+        "exact_file_contents": false,
+        "input_delivered": false,
+        "expected_tool_starts": false
+      },
+      "status": "failed",
+      "model_calls": 1,
+      "reported_fixture_tokens": {
+        "input_tokens": 100,
+        "output_tokens": 8192,
+        "total_tokens": 8292
+      },
+      "elapsed_ms": 30.609,
+      "cost": null,
+      "tool_starts": 0,
+      "result_bytes": null,
+      "result_sha256": null,
+      "cli_metrics": {
+        "cost": null,
+        "elapsed_ms": 21,
+        "input_tokens": 100,
+        "model_calls": 1,
+        "observed_input_tokens": 100,
+        "observed_output_tokens": 8192,
+        "output_tokens": 8192,
+        "total_tokens": 8292
+      },
+      "artifact_dir": "/private/var/folders/16/1dvtn08j5d15sssx4qdzy_r80000gn/T/bone-generation-ablation-tf3as7ee/atomic-final-verified/1-baseline"
+    },
+    {
+      "pair": 1,
+      "variant": "candidate",
+      "pass": true,
+      "acceptance": {
+        "unaccepted_proposal_zero_effects": true,
+        "exact_file_contents": true,
+        "input_delivered": true,
+        "expected_tool_starts": true
+      },
+      "status": "completed",
+      "model_calls": 5,
+      "reported_fixture_tokens": {
+        "input_tokens": 1900,
+        "output_tokens": 18312,
+        "total_tokens": 20212
+      },
+      "elapsed_ms": 417.855,
+      "cost": null,
+      "tool_starts": 3,
+      "result_bytes": 36047,
+      "result_sha256": "52929738ea5d5f54ba524e6fa7b74707b3c34ef50f7c93a89645f3f3f9173397",
+      "cli_metrics": {
+        "cost": null,
+        "elapsed_ms": 122,
+        "input_tokens": 1900,
+        "model_calls": 5,
+        "observed_input_tokens": 1900,
+        "observed_output_tokens": 18312,
+        "output_tokens": 18312,
+        "total_tokens": 20212
+      },
+      "artifact_dir": "/private/var/folders/16/1dvtn08j5d15sssx4qdzy_r80000gn/T/bone-generation-ablation-tf3as7ee/atomic-final-verified/1-candidate"
+    },
+    {
+      "pair": 2,
+      "variant": "baseline",
+      "pass": false,
+      "acceptance": {
+        "unaccepted_proposal_zero_effects": true,
+        "exact_file_contents": false,
+        "input_delivered": false,
+        "expected_tool_starts": false
+      },
+      "status": "failed",
+      "model_calls": 1,
+      "reported_fixture_tokens": {
+        "input_tokens": 100,
+        "output_tokens": 8192,
+        "total_tokens": 8292
+      },
+      "elapsed_ms": 28.943,
+      "cost": null,
+      "tool_starts": 0,
+      "result_bytes": null,
+      "result_sha256": null,
+      "cli_metrics": {
+        "cost": null,
+        "elapsed_ms": 21,
+        "input_tokens": 100,
+        "model_calls": 1,
+        "observed_input_tokens": 100,
+        "observed_output_tokens": 8192,
+        "output_tokens": 8192,
+        "total_tokens": 8292
+      },
+      "artifact_dir": "/private/var/folders/16/1dvtn08j5d15sssx4qdzy_r80000gn/T/bone-generation-ablation-tf3as7ee/atomic-final-verified/2-baseline"
+    },
+    {
+      "pair": 2,
+      "variant": "candidate",
+      "pass": true,
+      "acceptance": {
+        "unaccepted_proposal_zero_effects": true,
+        "exact_file_contents": true,
+        "input_delivered": true,
+        "expected_tool_starts": true
+      },
+      "status": "completed",
+      "model_calls": 5,
+      "reported_fixture_tokens": {
+        "input_tokens": 1900,
+        "output_tokens": 18312,
+        "total_tokens": 20212
+      },
+      "elapsed_ms": 107.853,
+      "cost": null,
+      "tool_starts": 3,
+      "result_bytes": 36047,
+      "result_sha256": "52929738ea5d5f54ba524e6fa7b74707b3c34ef50f7c93a89645f3f3f9173397",
+      "cli_metrics": {
+        "cost": null,
+        "elapsed_ms": 99,
+        "input_tokens": 1900,
+        "model_calls": 5,
+        "observed_input_tokens": 1900,
+        "observed_output_tokens": 18312,
+        "output_tokens": 18312,
+        "total_tokens": 20212
+      },
+      "artifact_dir": "/private/var/folders/16/1dvtn08j5d15sssx4qdzy_r80000gn/T/bone-generation-ablation-tf3as7ee/atomic-final-verified/2-candidate"
+    },
+    {
+      "pair": 3,
+      "variant": "baseline",
+      "pass": false,
+      "acceptance": {
+        "unaccepted_proposal_zero_effects": true,
+        "exact_file_contents": false,
+        "input_delivered": false,
+        "expected_tool_starts": false
+      },
+      "status": "failed",
+      "model_calls": 1,
+      "reported_fixture_tokens": {
+        "input_tokens": 100,
+        "output_tokens": 8192,
+        "total_tokens": 8292
+      },
+      "elapsed_ms": 28.216,
+      "cost": null,
+      "tool_starts": 0,
+      "result_bytes": null,
+      "result_sha256": null,
+      "cli_metrics": {
+        "cost": null,
+        "elapsed_ms": 20,
+        "input_tokens": 100,
+        "model_calls": 1,
+        "observed_input_tokens": 100,
+        "observed_output_tokens": 8192,
+        "output_tokens": 8192,
+        "total_tokens": 8292
+      },
+      "artifact_dir": "/private/var/folders/16/1dvtn08j5d15sssx4qdzy_r80000gn/T/bone-generation-ablation-tf3as7ee/atomic-final-verified/3-baseline"
+    },
+    {
+      "pair": 3,
+      "variant": "candidate",
+      "pass": true,
+      "acceptance": {
+        "unaccepted_proposal_zero_effects": true,
+        "exact_file_contents": true,
+        "input_delivered": true,
+        "expected_tool_starts": true
+      },
+      "status": "completed",
+      "model_calls": 5,
+      "reported_fixture_tokens": {
+        "input_tokens": 1900,
+        "output_tokens": 18312,
+        "total_tokens": 20212
+      },
+      "elapsed_ms": 105.733,
+      "cost": null,
+      "tool_starts": 3,
+      "result_bytes": 36047,
+      "result_sha256": "52929738ea5d5f54ba524e6fa7b74707b3c34ef50f7c93a89645f3f3f9173397",
+      "cli_metrics": {
+        "cost": null,
+        "elapsed_ms": 98,
+        "input_tokens": 1900,
+        "model_calls": 5,
+        "observed_input_tokens": 1900,
+        "observed_output_tokens": 18312,
+        "output_tokens": 18312,
+        "total_tokens": 20212
+      },
+      "artifact_dir": "/private/var/folders/16/1dvtn08j5d15sssx4qdzy_r80000gn/T/bone-generation-ablation-tf3as7ee/atomic-final-verified/3-candidate"
+    }
+  ],
+  "summary": {
+    "baseline": {
+      "passes": 0,
+      "trials": 3,
+      "model_calls": [
+        1,
+        1,
+        1
+      ],
+      "elapsed_ms": [
+        30.609,
+        28.943,
+        28.216
+      ],
+      "cost": null
+    },
+    "candidate": {
+      "passes": 3,
+      "trials": 3,
+      "model_calls": [
+        5,
+        5,
+        5
+      ],
+      "elapsed_ms": [
+        417.855,
+        107.853,
+        105.733
+      ],
+      "cost": null
+    }
+  },
+  "raw_artifacts_root": "/private/var/folders/16/1dvtn08j5d15sssx4qdzy_r80000gn/T/bone-generation-ablation-tf3as7ee",
+  "cross_checks": {
+    "candidate_binary_matches_final_build": true,
+    "candidate_source_patch_matches_final_source": true,
+    "cli_usage_matches_fixture_reported_usage": true,
+    "all_started_calls_owned_by_job_and_input": true,
+    "fixture_counter_origin": "synthetic protocol-reported counters; not tokenized or measured model consumption"
+  }
+}

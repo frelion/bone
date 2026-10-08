@@ -66,7 +66,7 @@ pub fn definitions(single_job: bool, read_only: bool) -> Vec<ToolDefinition> {
     ];
     if !read_only {
         tools.push(definition("edit_file", "Apply exact text edits to an existing workspace UTF-8 file (at most 16 MiB) using its whole-file expected_sha256. Each old_text must occur exactly once in the original source, including overlapping occurrences; edit spans cannot overlap. All edits are validated before replacement and do not cascade. Untouched bytes and permissions are preserved. Final identity checks narrow external-writer races but are not atomic CAS.", json!({"path":{"type":"string"},"expected_sha256":{"type":"string"},"edits":{"type":"array","minItems":1,"items":{"type":"object","properties":{"old_text":{"type":"string","minLength":1},"new_text":{"type":"string"}},"required":["old_text","new_text"],"additionalProperties":false}}}), &["path","expected_sha256","edits"]));
-        tools.push(definition("write_file", "Replace a workspace file using expected_sha256 from read_file. Content and file identity are checked again immediately before replacement; an external writer racing after that check can still change it. For a NEW file pass expected_sha256=null; creation never overwrites an existing target. Existing files are limited to 16 MiB. All contents must be provided.", json!({"path":{"type":"string"},"content":{"type":"string"},"expected_sha256":{"type":["string","null"]}}), &["path","content","expected_sha256"]));
+        tools.push(definition("write_file", "Write a workspace file with explicit mode replace or append. replace supplies the complete new contents; for a NEW file pass expected_sha256=null and creation never overwrites an existing target. append supplies only the next fragment and requires an existing file's expected_sha256. Use the resulting sha256 for the next append. Both modes install the entire resulting file atomically, preserve existing permissions, and check original content and file identity immediately before installation. The resulting file is limited to 16 MiB. External writes racing after the final check are not atomic CAS.", json!({"path":{"type":"string"},"mode":{"type":"string","enum":["replace","append"]},"content":{"type":"string"},"expected_sha256":{"type":["string","null"]}}), &["path","mode","content","expected_sha256"]));
         tools.push(definition("shell", SHELL_DESCRIPTION, json!({"command":{"type":"string"},"timeout_seconds":{"type":"integer","minimum":1,"maximum":MAX_SHELL_TIMEOUT_SECONDS,"default":DEFAULT_SHELL_TIMEOUT_SECONDS}}), &["command"]));
     }
     if !single_job {
@@ -665,7 +665,7 @@ fn edit_file_prepared(
         }
         content.push_str(&source[offset..]);
         Ok((
-            json!({"path":relative,"expected_sha256":expected,"content":content}),
+            json!({"path":relative,"mode":"replace","expected_sha256":expected,"content":content}),
             edits.len(),
         ))
     })();
@@ -803,12 +803,23 @@ fn write_file_prepared(
 ) -> ToolOutcome {
     let mut installed = false;
     let result = (|| -> Result<Value> {
+        let mode = string_arg(args, "mode")?;
+        ensure!(
+            matches!(mode, "replace" | "append"),
+            "mode must be replace or append"
+        );
         let path = workspace_path(workspace, string_arg(args, "path")?)?;
         let content = string_arg(args, "content")?;
         let expected = args
             .get("expected_sha256")
             .context("expected_sha256 is required (null for a new file)")?;
         let original = file_version(&path)?;
+        if mode == "append" {
+            ensure!(
+                original.is_some() && expected.is_string(),
+                "append requires an existing file and its expected SHA-256"
+            );
+        }
         if let Some(original) = &original {
             let expected = expected
                 .as_str()
@@ -820,6 +831,26 @@ fn write_file_prepared(
         } else {
             ensure!(expected.is_null(), "expected file no longer exists");
         }
+        let retained_bytes = if mode == "append" {
+            original.as_ref().unwrap().bytes
+        } else {
+            0
+        };
+        ensure!(
+            content.len() as u64 <= FILE_LIMIT - retained_bytes,
+            "resulting file exceeds 16 MiB"
+        );
+        let mut contents = if mode == "append" {
+            let bytes = source_bytes(&path.canonicalize()?)?;
+            ensure!(
+                sha256(&bytes) == original.as_ref().unwrap().sha256,
+                "file changed while preparing append; read it again before writing"
+            );
+            bytes
+        } else {
+            Vec::new()
+        };
+        contents.extend_from_slice(content.as_bytes());
         let parent = path.parent().context("file needs a parent")?;
         std::fs::create_dir_all(parent)?;
         let _ = workspace_path(workspace, string_arg(args, "path")?)?;
@@ -836,7 +867,7 @@ fn write_file_prepared(
                 crate::filesystem::copy_access(&std::fs::File::open(&path)?, &file)?;
                 file.set_permissions(metadata.permissions())?;
             }
-            file.write_all(content.as_bytes())?;
+            file.write_all(&contents)?;
             file.sync_all()?;
             before_install(&path)?;
             let _ = workspace_path(workspace, string_arg(args, "path")?)?;
@@ -875,7 +906,7 @@ fn write_file_prepared(
             let _ = std::fs::remove_file(&temporary);
         }
         replacement?;
-        Ok(json!({"bytes":content.len(),"sha256":sha256(content.as_bytes())}))
+        Ok(json!({"bytes":contents.len(),"sha256":sha256(&contents)}))
     })();
     match result {
         Ok(content) => ToolOutcome {

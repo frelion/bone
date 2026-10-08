@@ -1,0 +1,107 @@
+{
+  "source": "real ChatGPT subscription via native Rig; two turns across CLI restart",
+  "model": "gpt-6-luna",
+  "workspace": "/Users/zzhang/.bone/acceptance/2026-10-08-generation-continuation-live/trial-_50fhkot/workspace",
+  "session_id": "b3b90f11-bfa2-4402-b3b3-fa91314f3144",
+  "turns": [
+    {
+      "turn": 1,
+      "exit_code": 0,
+      "status": "completed",
+      "metrics": {
+        "cost": null,
+        "elapsed_ms": 22565,
+        "input_tokens": 20920,
+        "model_calls": 8,
+        "observed_input_tokens": 20920,
+        "observed_output_tokens": 539,
+        "output_tokens": 539,
+        "total_tokens": 21459
+      },
+      "wall_seconds": 23.979,
+      "error": null
+    },
+    {
+      "turn": 2,
+      "exit_code": 0,
+      "status": "completed",
+      "metrics": {
+        "cost": null,
+        "elapsed_ms": 30330,
+        "input_tokens": 24325,
+        "model_calls": 6,
+        "observed_input_tokens": 24325,
+        "observed_output_tokens": 892,
+        "output_tokens": 892,
+        "total_tokens": 25217
+      },
+      "wall_seconds": 30.345,
+      "error": null
+    }
+  ],
+  "independent_verification": true,
+  "verification_error": null,
+  "notes_present": true,
+  "tests_unchanged": true,
+  "events": {
+    "model_started": 14,
+    "model_limited": 0,
+    "summary": 0,
+    "tool_started": 12,
+    "model_failed": 0,
+    "delivery": 2
+  },
+  "tool_modes": [
+    {
+      "name": "list_files",
+      "mode": null
+    },
+    {
+      "name": "read_file",
+      "mode": null
+    },
+    {
+      "name": "read_file",
+      "mode": null
+    },
+    {
+      "name": "edit_file",
+      "mode": null
+    },
+    {
+      "name": "write_file",
+      "mode": "replace"
+    },
+    {
+      "name": "shell",
+      "mode": null
+    },
+    {
+      "name": "write_file",
+      "mode": "append"
+    },
+    {
+      "name": "read_file",
+      "mode": null
+    },
+    {
+      "name": "read_file",
+      "mode": null
+    },
+    {
+      "name": "edit_file",
+      "mode": null
+    },
+    {
+      "name": "shell",
+      "mode": null
+    },
+    {
+      "name": "write_file",
+      "mode": "append"
+    }
+  ],
+  "cost": null,
+  "scope": "This verifies the new schema, native invocation, persisted multi-turn work and diagnostics. No forced Length on subscription; does not reproduce the remote New API incident.",
+  "test_source_sha256": "fd9bdf60764ff62b9e4cd611b9e5a1e52cd6de22ff30074186e00ce0226e3607"
+}

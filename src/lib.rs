@@ -26,6 +26,9 @@ mod model;
 pub mod runtime;
 pub mod state;
 mod store;
+#[cfg(test)]
+#[path = "../tests/support/server.rs"]
+mod test_server;
 mod tools;
 #[cfg(windows)]
 mod windows;

@@ -65,6 +65,18 @@ pub struct Profile {
 }
 
 impl Profile {
+    pub(crate) fn model_name(&self) -> Option<&str> {
+        match &self.model {
+            ModelReference::Registry(reference) => Some(reference.model()),
+            ModelReference::Cohere { model, .. } | ModelReference::Ollama { model, .. } => {
+                Some(model)
+            }
+            ModelReference::Bedrock { bedrock } => Some(bedrock),
+            ModelReference::VertexAi { vertexai } => Some(vertexai),
+            ModelReference::Candle { .. } => None,
+        }
+    }
+
     /// Native provider identity, independent of model and endpoint. Credentials
     /// stored by BONE are bound to this identity and never move across providers.
     pub fn provider_identity(&self) -> String {

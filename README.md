@@ -20,7 +20,7 @@ bone tools --read-only --single-job --json
 
 ## 构建与配置
 
-macOS、Windows 和 Linux 的预编译包见 [GitHub Releases](https://github.com/frelion/bone/releases/latest)，下载对应架构后解压，安装步骤在包内 `INSTALL.txt`。已发布版本的范围见 [0.9.4 发布说明](docs/releases/0.9.4.md)。本分支 0.10.0 的行为变化见 [更新说明](docs/releases/0.10.0.md)。
+macOS、Windows 和 Linux 的预编译包见 [GitHub Releases](https://github.com/frelion/bone/releases/latest)，下载对应架构后解压，安装步骤在包内 `INSTALL.txt`。0.10.1 的生成续做与分步写入见 [发布说明](docs/releases/0.10.1.md)，此前中断机制的简化见 [0.10.0 更新说明](docs/releases/0.10.0.md)。
 
 预编译版运行不需要 Rust、Python 或编译器。以下源码构建需要 Rust 1.96 或更新版本；本地协议验收还需要 Python 3。
 
@@ -31,7 +31,7 @@ bone --version
 bone providers
 ```
 
-源码安装后的版本应为 `bone 0.10.0`。如果仍显示旧版，用 `command -v bone` 检查实际入口；其他目录中更靠前的旧 launcher 会遮住 `~/.cargo/bin/bone`。可以先用 `~/.cargo/bin/bone tui` 启动，或将原 launcher 备份后指向这个安装位置。
+源码安装后的版本应为 `bone 0.10.1`。如果仍显示旧版，用 `command -v bone` 检查实际入口；其他目录中更靠前的旧 launcher 会遮住 `~/.cargo/bin/bone`。可以先用 `~/.cargo/bin/bone tui` 启动，或将原 launcher 备份后指向这个安装位置。
 
 `target/release/bone` 是构建目录内的文件，只有在包含它的 checkout 中才能通过相对路径运行。安装后的 `bone` 可在任意项目目录中使用。
 
@@ -185,7 +185,7 @@ Rust 库的执行操作通过 `runtime::Engine`：`post`、`step`、`stop`、`re
 
 ## 工具权限与中断写入
 
-`--read-only` 禁用 `edit_file`、`write_file` 与 `shell`，保留 `search_files` 等读取工具。文件工具限制在 workspace 内，拒绝路径向上遍历和已知 symlink escape。`write_file` 必须携带读取结果的 SHA-256；创建新文件使用 `expected_sha256 = null`。
+`--read-only` 禁用 `edit_file`、`write_file` 与 `shell`，保留 `search_files` 等读取工具。文件工具限制在 workspace 内，拒绝路径向上遍历和已知 symlink escape。`write_file` 必须指定 `mode = replace | append`。创建用 `replace` 和 `expected_sha256 = null`；追加到已有文件用 `append` 和当前 SHA，下一片段使用上次成功返回的新 SHA。每片段通过现有原子安装流程写入，整体文件最多 16 MiB，工作区可保留未完成的中间版本。
 
 `read_file` 默认返回 8 KiB，按 `next_offset` 继续读取；显式 `limit` 最大为 32 KiB。刚返回的结果先交给工作模型；超限时压缩更早的已消费历史，再为新结果提供带原文引用的有界预览。Agent 可回查原事件补全省略部分。单条用户输入或原生调用参数本身无法装入上下文时仍会明确失败。
 
@@ -202,6 +202,14 @@ Rust 库的执行操作通过 `runtime::Engine`：`post`、`step`、`stop`、`re
 workspace 写锁存放在操作系统用户目录的 `~/.bone/workspace-locks`，独立于数据目录和临时目录。同一系统用户、相同 canonical workspace 根共享写锁；嵌套但根不同的 workspace 不共享。前台 shell 继承实际锁；BONE 被硬杀后仍在运行的 shell 结束前，同根的其他会话不能写入。该保证不覆盖主动关闭继承文件描述符、自行脱离的后台程序。已有文件的哈希复核也无法消除与任意外部编辑器之间的最后竞争窗口。
 
 如果动作完成后的 SQLite 提交失败，执行器停止后续状态修改并要求重新打开，以持久启动记录恢复。
+
+### 生成达到限制时
+
+Rig 返回 `Length` 时，本轮全部提案只保存审计，不执行工具也不交付。Job 保留原输入和已经完成的动作，最多重新规划一次，尝试更小的完整动作；完整工作回复被接受后，下一段工作重新计算。重启、停止或恢复不会刷新这次机会，调用继续消耗原输入的共享额度。BONE 不自动提高 `max_tokens`，不猜测推理参数。
+
+摘要沿用所选连接的原生生成配置。受限摘要最多重试原材料一半大小的完整历史前缀；提交摘要前检查后续工作请求实际缩小。失败保留旧摘要和全部原文。过滤、明确上下文限制、未知结束原因和调用错误分别暂停并说明原因。TUI 自动续做时显示“本轮生成未完成，正在继续”。
+
+调用事件分别记录 `configured_generation`（传给 Rig 的已配置参数）和 `provider_reported`（服务端报告的用量等事实），以及 Rig 原生安全观察。缺失值保持未知，配置值不代表服务端实际生效上限。完整请求与凭据不进入这些诊断。实现与验证范围见 [生成续做验收](docs/results/2026-10-08-generation-continuation/README.md)。
 
 ## 官方 companion provider
 

@@ -1,0 +1,40 @@
+{
+  "branch": "codex/core-simplify",
+  "baseline_commit": "b674fc9edcd51cdcaf3c360aae38a985ccb2f78b",
+  "scope": "current source, local macOS; protocol fixtures and an independent real subscription task",
+  "checks": {
+    "cargo_test_locked": {
+      "passed": 290,
+      "failed": 0,
+      "ignored_subprocess_helpers": 1
+    },
+    "clippy_all_targets_all_features": "passed",
+    "python_unittest": {
+      "passed": 8
+    },
+    "fmt": "passed",
+    "diff_check": "passed",
+    "tui_pty": {
+      "passed": 32,
+      "exit_code": 0,
+      "binary_sha256": "6970454fe423ef3758d7641fb16ad92fffa040fcfd4ee62f632cb1e3cb22f61b",
+      "log_sha256": "06d45f2068fd6d15e3231831039640643c48b68b5738aa1f2aef6ffe39e5eccc"
+    }
+  },
+  "binary_sha256": "6970454fe423ef3758d7641fb16ad92fffa040fcfd4ee62f632cb1e3cb22f61b",
+  "source_sha256": {
+    "src/runtime.rs": "22efba5a020a0ff548e2747747f0ca6bca2308646b492f0c1efb1edcccbc33f2",
+    "src/context.rs": "1856730cd447d1d6a8c1c12403c4543c83c0915bc0bbbc4782e6412a834dd9fb",
+    "src/tools.rs": "488c999c728b22855eae9e2736d30e2933d99e2cb75f500d8329bc74982df372",
+    "src/config.rs": "cfb05737c3c534a1abdef4337ef1f8a112333ac552f086cf176ab25ae91a7d76",
+    "src/state.rs": "dca63e615b8f7d2b492d18336eea69999ec223a0ffa63d018d00cc19d595c7f9",
+    "src/lib.rs": "4782cfbe2218049ae9ec9a822ed302874d28915d60ad33ea8d78efa28dbb28cf",
+    "src/tui.rs": "993b600af023da8dd90414d8b2cc1559dd520f35a43726eacebc23f23a8bc2db",
+    "tests/generation_limits.rs": "4ec94020fbdbd3d5c7c572e7dc11de4901195ff4e6c8f672ddd59f93507c1a68",
+    "tests/scripted_responses.py": "8f7d43a8fd346cee0963361954cee768830c18d38bed8fe32766245643bdebcc"
+  },
+  "tests_log_sha256": "6c533772e0f58f6242de4b4888c284532a5f4ae5f5e64ad44305572131f16587",
+  "live_snapshot_note": "Live two-turn task preceded the final atomic-commit and stop-diagnostic refinements; final native regression and fixed comparison cover those refinements.",
+  "new_api_real_call": "not verified: remote incident configuration and credentials unavailable",
+  "new_cross_platform_native_runs": false
+}

@@ -210,7 +210,7 @@ async fn exact_wait_handoff_and_late_instruction_preserve_native_protocol() {
         {"match_job_title":"Conversation","contains":["A exact delivery","B exact delivery"],"text":"Assigned work delivered"},
         call("job_handoff","handoff",json!({"title":"Ledger"})),
         {"text":"Focused ledger work continues"},
-        call("write_file","stale_write",json!({"path":"stale.txt","content":"obsolete","expected_sha256":null})),
+        call("write_file","stale_write",json!({"mode":"replace","path":"stale.txt","content":"obsolete","expected_sha256":null})),
         {"contains":["LATEST_CONSTRAINT"],"text":"Latest instruction honored"}]}),
         "fixtures/long_task/server.py",
     );
@@ -474,7 +474,7 @@ async fn killed_owner_blocks_competing_writes_only_until_its_shell_physically_ex
     let mut competing = call(
         "write_file",
         "competing_effect",
-        json!({"path":"intruder.txt","content":"written after the original process exited","expected_sha256":null}),
+        json!({"mode":"replace","path":"intruder.txt","content":"written after the original process exited","expected_sha256":null}),
     );
     competing["match_last_user_contains"] = json!("Attempt another workspace write");
     let fixture = Fixture::script(

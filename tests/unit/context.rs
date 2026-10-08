@@ -424,6 +424,192 @@ fn summary_prefix_fits_its_budget_without_splitting_a_long_tool_batch() {
 }
 
 #[test]
+fn summary_retry_halves_original_source_and_keeps_complete_native_batches() {
+    let mut job = Job::new("summary retry");
+    let mut events = BTreeMap::new();
+    let active = append_input(
+        &mut job,
+        &mut events,
+        "Keep 中文, quotes \" and newlines\nverbatim.",
+    );
+    job.active_input = Some(active.clone());
+    let queued = append_input(
+        &mut job,
+        &mut events,
+        "Explain later; do not replace the task.",
+    );
+    job.inbox.push_back(queued.clone());
+    for index in 0..6 {
+        let first = call(&format!("first-{index}"), "read_file");
+        let second = call(&format!("second-{index}"), "search_files");
+        append_response(
+            &mut job,
+            &mut events,
+            call_response(vec![first.clone(), second.clone()]),
+        );
+        append(
+            &mut job,
+            &mut events,
+            "tool_result",
+            json!({"message":Message::tool_results(vec![
+                first.result(vec![ToolResultContent::Json {value:json!({"text":"quoted \" evidence\n".repeat(100)})}]),
+                second.result(vec![ToolResultContent::Json {value:json!({"text":"matches".repeat(100)})}]),
+            ])}),
+        );
+    }
+    append_response(
+        &mut job,
+        &mut events,
+        response(Message::assistant("Consumed the evidence.")),
+    );
+    let (source, covered) = compaction_prefix(&job, &events, 1, usize::MAX)
+        .unwrap()
+        .unwrap();
+    let source_chars = serde_json::to_string(&source).unwrap().chars().count();
+    append(
+        &mut job,
+        &mut events,
+        "model_failed",
+        json!({"response":response(Message::assistant("FAILED SUMMARY MUST NOT BE INPUT".repeat(100)))}),
+    );
+    let later = append_response(
+        &mut job,
+        &mut events,
+        response(Message::assistant("LATER WORK MUST NOT BE INPUT")),
+    );
+    let durable_job = job.clone();
+    let durable_events = events.clone();
+    let (retry, retry_covered) = smaller_compaction_prefix(&job, &events, &covered, source_chars)
+        .unwrap()
+        .unwrap();
+    let encoded = serde_json::to_string(&retry).unwrap();
+    assert!(encoded.chars().count() <= source_chars / 2);
+    assert!(retry_covered.len() < covered.len());
+    assert!(!retry_covered.contains(&active));
+    assert!(!retry_covered.contains(&queued));
+    assert!(!retry_covered.contains(&later));
+    assert!(!encoded.contains("FAILED SUMMARY"));
+    assert!(!encoded.contains("LATER WORK"));
+    assert_eq!(
+        original_input(&retry[0]),
+        Message::user("Keep 中文, quotes \" and newlines\nverbatim.")
+    );
+    assert_eq!(
+        original_input(&retry[1]),
+        Message::user("Explain later; do not replace the task.")
+    );
+    let mut calls = BTreeSet::new();
+    for message in retry {
+        match message {
+            Message::Assistant { content, .. } => {
+                assert!(calls.is_empty(), "an earlier native batch must be complete");
+                for part in content {
+                    if let AssistantContent::ToolCall(call) = part {
+                        calls.insert(serde_json::to_string(&call.id).unwrap());
+                    }
+                }
+            }
+            Message::User { content } => {
+                for part in content {
+                    if let UserContent::ToolResult(result) = part {
+                        assert!(calls.remove(&serde_json::to_string(&result.call).unwrap()));
+                    }
+                }
+            }
+            Message::System { .. } => {}
+        }
+    }
+    assert!(calls.is_empty());
+    assert_eq!(job, durable_job);
+    assert_eq!(events, durable_events);
+}
+
+#[test]
+fn summary_retry_stops_when_one_unchanged_cycle_cannot_fit_half_the_source() {
+    let mut job = Job::new("indivisible source");
+    let mut events = BTreeMap::new();
+    let read = call("large-cycle", "read_file");
+    append_response(&mut job, &mut events, call_response(vec![read.clone()]));
+    append(
+        &mut job,
+        &mut events,
+        "tool_result",
+        json!({"message":Message::tool_results(vec![
+            read.result(vec![ToolResultContent::Json {value:json!({"text":"x".repeat(8000)})}]),
+        ])}),
+    );
+    append_response(
+        &mut job,
+        &mut events,
+        response(Message::assistant("Consumed.")),
+    );
+    let (source, covered) = compaction_prefix(&job, &events, 1, usize::MAX)
+        .unwrap()
+        .unwrap();
+    let chars = serde_json::to_string(&source).unwrap().chars().count();
+    assert!(
+        smaller_compaction_prefix(&job, &events, &covered, chars)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn candidate_summary_must_shrink_the_full_work_request_and_keeps_pending_inputs() {
+    let mut job = Job::new("candidate summary");
+    let mut events = BTreeMap::new();
+    let old = append_input(&mut job, &mut events, &"old consumed evidence".repeat(200));
+    let active = append_input(&mut job, &mut events, "Original ACTIVE request.");
+    let queued = append_input(&mut job, &mut events, "Original QUEUED request.");
+    job.active_input = Some(active.clone());
+    job.inbox.push_back(queued.clone());
+    let native = CompletionRequest::from(Vec::<Message>::new())
+        .preamble("Work instructions and full tools stay.");
+    let candidate = |text: String| {
+        Event::new(
+            "session",
+            "summary",
+            json!({"response":response(Message::assistant(text)),"covered_ids":[old,active,queued]}),
+        )
+    };
+    assert!(
+        summary_shrinks_work(
+            &job,
+            &events,
+            &candidate("Consumed evidence.".into()),
+            &native
+        )
+        .unwrap()
+    );
+    assert!(
+        !summary_shrinks_work(
+            &job,
+            &events,
+            &candidate("Longer summary".repeat(500)),
+            &native
+        )
+        .unwrap()
+    );
+    let pending_only = Event::new(
+        "session",
+        "summary",
+        json!({
+            "response":response(Message::assistant("A replacement for pending inputs.")),
+            "covered_ids":[active,queued],
+        }),
+    );
+    assert!(
+        !summary_shrinks_work(&job, &events, &pending_only, &native).unwrap(),
+        "covering ACTIVE and QUEUED IDs must not let a summary erase their native messages"
+    );
+    assert!(job.summary.is_none());
+    assert_eq!(
+        original_input(&build_history(&job, &events).unwrap()[1]),
+        Message::user("Original ACTIVE request.")
+    );
+}
+
+#[test]
 fn oversized_complete_tool_batch_has_explicit_native_previews_and_exact_source_ids() {
     let mut job = Job::new("large reads");
     let mut events = BTreeMap::new();
@@ -485,8 +671,7 @@ fn fresh_native_call_arguments_are_never_silently_shortened_to_fit() {
     let mut job = Job::new("large edit");
     let mut events = BTreeMap::new();
     let mut edit = call("edit", "write_file");
-    edit.function.arguments =
-        json!({"path":"large.rs","content":"x".repeat(20_000),"expected_sha256":null});
+    edit.function.arguments = json!({"mode":"replace","path":"large.rs","content":"x".repeat(20_000),"expected_sha256":null});
     append_response(&mut job, &mut events, call_response(vec![edit.clone()]));
     append(
         &mut job,

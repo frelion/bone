@@ -417,7 +417,12 @@ impl App {
         }
         if matches!(
             event.kind.as_str(),
-            "model_message" | "model_failed" | "cancelled"
+            "model_message"
+                | "model_failed"
+                | "model_limited"
+                | "summary"
+                | "model_cancelled"
+                | "cancelled"
         ) && let Some(call) = &event.call_id
         {
             self.ui.remove_message(&format!("live:{call}"));
@@ -430,6 +435,9 @@ impl App {
         }
         if event.kind == "question" && engine.is_unanswered_question(event) {
             self.ui.notify("有问题待回答 · Ctrl+P 选择回复");
+        }
+        if event.kind == "model_limited" && event.data["retry_allowed"] == true {
+            self.ui.notify("本轮生成未完成，正在继续");
         }
         if event.kind == "tool_result" && tool_failed(engine, event)? {
             self.last_tool_failure = Some(format!(
@@ -2620,7 +2628,9 @@ fn active_call(engine: &Engine, call: &str) -> Result<ActiveCall> {
         .read_call_event(call, "tool_started")
         .or_else(|_| engine.read_call_event(call, "model_started"))?;
     let phase = if event.kind == "model_started" {
-        if event.data["purpose"] == "summary" {
+        if !event.data["recovery_of"].is_null() {
+            "本轮生成未完成，正在继续"
+        } else if event.data["purpose"] == "summary" {
             "整理上下文"
         } else {
             "思考中"
@@ -2670,6 +2680,31 @@ fn active_call(engine: &Engine, call: &str) -> Result<ActiveCall> {
     })
 }
 
+fn generation_failure_text(error: &str) -> Option<String> {
+    let reason = if error.starts_with("generation remained incomplete") {
+        "较小动作的续做仍未完成，已暂停"
+    } else if error.starts_with("summary generation remained incomplete") {
+        "较小历史片段的摘要仍未完成，已暂停"
+    } else if error.starts_with("summary reached a generation limit") {
+        "摘要达到限制，无法选取更小的完整历史片段"
+    } else if error.starts_with("model context limit reached") {
+        "模型上下文达到限制"
+    } else if error.starts_with("provider filtered the generation") {
+        "服务端过滤了本轮生成"
+    } else if error.starts_with("provider ended generation with") {
+        "服务端报告了未识别的结束原因"
+    } else if error.starts_with("summary did not reduce") {
+        "摘要没有缩小后续请求"
+    } else if error.starts_with("summary returned no text")
+        || error.starts_with("summary unexpectedly requested")
+    {
+        "摘要未返回有效的完整文本"
+    } else {
+        return None;
+    };
+    Some(format!("{reason}。已完成的操作和原始历史已保留。\n{error}"))
+}
+
 fn current_status(engine: &Engine, input: Option<&str>, tool_failure: Option<&str>) -> String {
     let state = engine.state();
 
@@ -2685,6 +2720,18 @@ fn current_status(engine: &Engine, input: Option<&str>, tool_failure: Option<&st
         .filter(|job| job.state == JobState::Running && job.current_call.is_some())
         .count();
     if active > 0 {
+        if state
+            .jobs
+            .values()
+            .filter_map(|job| job.current_call.as_ref())
+            .any(|call| {
+                engine
+                    .read_call_event(call, "model_started")
+                    .is_ok_and(|e| !e.data["recovery_of"].is_null())
+            })
+        {
+            return "本轮生成未完成，正在继续".into();
+        }
         return if active == 1 {
             "正在执行".into()
         } else {
@@ -2701,6 +2748,14 @@ fn current_status(engine: &Engine, input: Option<&str>, tool_failure: Option<&st
         )
     });
     if terminal.is_some_and(|event| event.kind != "delivery") {
+        if terminal.is_some_and(|event| {
+            event.kind == "failure"
+                && event.data["error"]
+                    .as_str()
+                    .is_some_and(|e| generation_failure_text(e).is_some())
+        }) {
+            return "生成暂停 · 已有进度保留".into();
+        }
         return terminal_label(&terminal.unwrap().kind).into();
     }
     if !state.pending_inputs.is_empty() {
@@ -3053,7 +3108,12 @@ fn proposed_change_preview(name: &str, args: &Value) -> String {
             preview.push_str("\n[更多内容保留在原生参数]");
         }
         return format!(
-            "拟写入内容（可能覆盖现有文件）\n```text\n{}\n```",
+            "{}\n```text\n{}\n```",
+            if args["mode"] == "append" {
+                "拟追加到文件末尾"
+            } else {
+                "拟写入内容（可能覆盖现有文件）"
+            },
             preview.chars().take(2000).collect::<String>()
         );
     }
@@ -3098,7 +3158,11 @@ fn ingest(engine: &Engine, event: &Event, ui: &mut View) -> Result<()> {
         ui.push_message(Message {
             summary: None,
             kind,
-            text: body.clone(),
+            text: if event.kind == "failure" {
+                generation_failure_text(&body).unwrap_or_else(|| body.clone())
+            } else {
+                body.clone()
+            },
             event_id: Some(event.id.clone()),
         });
     }
@@ -3258,10 +3322,18 @@ fn ingest(engine: &Engine, event: &Event, ui: &mut View) -> Result<()> {
             ),
             Tone::Success,
         ),
+        "model_limited" => (
+            if event.data["retry_allowed"] == true {
+                "本轮生成未完成，正在继续".into()
+            } else {
+                "生成仍未完成 · 已保留进度".into()
+            },
+            Tone::Info,
+        ),
         "question" => ("向你提问".into(), Tone::Info),
         "delivery" => ("本轮交付".into(), Tone::Success),
         "failure" | "model_failed" => ("执行失败".into(), Tone::Error),
-        "cancelled" => ("调用已取消".into(), Tone::Normal),
+        "model_cancelled" | "cancelled" => ("调用已取消".into(), Tone::Normal),
         "stopped" | "input_paused" => ("工作已暂停".into(), Tone::Info),
         "resumed" => ("工作已恢复".into(), Tone::Info),
         "input_resolved" => ("旧输入已结算".into(), Tone::Success),

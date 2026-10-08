@@ -1,6 +1,6 @@
 [package]
 name = "bone"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2024"
 rust-version = "1.96"
 description = "One conversational agent, persistent internal jobs, native Rig providers"

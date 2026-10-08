@@ -160,7 +160,7 @@ fn write_call() -> ToolCall {
     tool(
         "write_file",
         "provider-write",
-        json!({"path":"output.txt","content":"never replay","expected_sha256":null}),
+        json!({"mode":"replace","path":"output.txt","content":"never replay","expected_sha256":null}),
     )
 }
 
@@ -276,7 +276,7 @@ async fn tool_start_transaction_failure_leaves_no_effect_or_start_record() {
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         read_native_request(&mut socket).await;
-        send_native_response(&mut socket,json!({"role":"assistant","content":"","tool_calls":[{"function":{"name":"write_file","arguments":{"path":"output.txt","content":"never replay","expected_sha256":null}}}]})).await;
+        send_native_response(&mut socket,json!({"role":"assistant","content":"","tool_calls":[{"function":{"name":"write_file","arguments":{"mode":"replace","path":"output.txt","content":"never replay","expected_sha256":null}}}]})).await;
     });
     let mut engine = Engine::open(
         &fixture.data,
@@ -325,9 +325,9 @@ async fn completed_effect_with_a_failed_result_commit_recovers_once_and_can_cont
     let server = tokio::spawn(async move {
         let mut requests = Vec::new();
         for message in [
-            json!({"role":"assistant","content":"","tool_calls":[{"function":{"name":"write_file","arguments":{"path":"effect.txt","content":"effect survived the failed commit","expected_sha256":null}}}]}),
+            json!({"role":"assistant","content":"","tool_calls":[{"function":{"name":"write_file","arguments":{"mode":"replace","path":"effect.txt","content":"effect survived the failed commit","expected_sha256":null}}}]}),
             json!({"role":"assistant","content":"","tool_calls":[{"function":{"name":"read_file","arguments":{"path":"effect.txt"}}}]}),
-            json!({"role":"assistant","content":"","tool_calls":[{"function":{"name":"write_file","arguments":{"path":"checked.txt","content":"Observed the persisted effect","expected_sha256":null}}}]}),
+            json!({"role":"assistant","content":"","tool_calls":[{"function":{"name":"write_file","arguments":{"mode":"replace","path":"checked.txt","content":"Observed the persisted effect","expected_sha256":null}}}]}),
             json!({"role":"assistant","content":"Inspected the persisted effect and completed the followup write.","tool_calls":[]}),
         ] {
             let (mut socket, _) = listener.accept().await.unwrap();

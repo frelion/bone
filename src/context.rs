@@ -46,6 +46,10 @@ fn summary(
     let event = events
         .get(id)
         .with_context(|| format!("missing summary event {id}"))?;
+    summary_event(event)
+}
+
+fn summary_event(event: &Event) -> Result<(Option<Message>, BTreeSet<String>)> {
     ensure!(
         event.kind == "summary",
         "job summary does not refer to a summary event"
@@ -302,9 +306,32 @@ pub fn bounded_work_history(
     Ok(Some(best))
 }
 
-/// Count the whole native request, including instructions, tools, and options.
-pub fn serialized_chars(request: &CompletionRequest) -> Result<usize> {
-    Ok(serde_json::to_string(request)?.chars().count())
+/// Count native messages or a whole request, including its instructions and tools.
+pub fn serialized_chars(value: &impl serde::Serialize) -> Result<usize> {
+    Ok(serde_json::to_string(value)?.chars().count())
+}
+
+/// Test a summary against the same complete work request before committing it.
+/// Original inputs, audit events and the previous valid summary stay untouched.
+pub fn summary_shrinks_work(
+    job: &Job,
+    events: &BTreeMap<String, Event>,
+    candidate: &Event,
+    work_template: &CompletionRequest,
+) -> Result<bool> {
+    let mut before = work_template.clone();
+    before.chat_history.extend(build_history(job, events)?);
+    // Match the candidate's actual coverage on commit, including any retained
+    // source that an earlier summary had hidden.
+    let (background, covered) = summary_event(candidate)?;
+    let mut after = work_template.clone();
+    after.chat_history.extend(background);
+    after.chat_history.extend(
+        retained(job, events, &covered)?
+            .into_iter()
+            .map(|(_, message)| message),
+    );
+    Ok(serialized_chars(&after)? < serialized_chars(&before)?)
 }
 
 fn source_note(ids: &[String]) -> Message {
@@ -339,6 +366,34 @@ pub fn compaction_prefix(
         entries.truncate(frontier);
     }
     prefix_from_entries(job, background, entries, max_prefix_chars, true)
+}
+
+/// Retry only the original consumed source, at no more than half its size.
+/// A complete tool cycle must fit unchanged; the failed summary is never input.
+pub fn smaller_compaction_prefix(
+    job: &Job,
+    events: &BTreeMap<String, Event>,
+    failed_covered_ids: &[String],
+    failed_source_chars: usize,
+) -> Result<Option<(Vec<Message>, Vec<String>)>> {
+    let (background, covered) = summary(job, events)?;
+    let mut entries = retained(job, events, &covered)?;
+    if let Some(frontier) = fresh_tool_frontier(&entries) {
+        entries.truncate(frontier);
+    }
+    let failed: BTreeSet<_> = failed_covered_ids.iter().collect();
+    let Some(end) = entries.iter().rposition(|(id, _)| failed.contains(id)) else {
+        return Ok(None);
+    };
+    entries.truncate(end + 1);
+    let pending = pinned(job);
+    ensure!(
+        entries
+            .iter()
+            .all(|(id, _)| failed.contains(id) || pending.contains(id.as_str())),
+        "summary retry source differs from the failed prefix"
+    );
+    prefix_from_entries(job, background, entries, failed_source_chars / 2, false)
 }
 
 fn preview_tool_results(entries: &mut [(String, Message)], limit: usize) -> Result<bool> {

@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::test_server as generation_server;
+
 #[test]
 fn profile_switch_validates_before_mutation_and_preserves_paused_session() {
     let (_directory, mut engine) = fixture_engine();
@@ -38,6 +40,7 @@ async fn profile_switch_preserves_an_in_flight_call_and_changes_future_recipe() 
             abort: task.abort_handle(),
             tool: None,
             cancellation: None,
+            observations: None,
         },
     );
     engine.state.jobs.get_mut(&job).unwrap().state = JobState::Running;
@@ -251,7 +254,7 @@ async fn stop_collects_tool_result_before_releasing_ownership_and_allows_new_wor
         &job,
         "write_file",
         json!({
-            "path":"after-stop.txt","content":"new work","expected_sha256":null,
+            "mode":"replace","path":"after-stop.txt","content":"new work","expected_sha256":null,
         }),
     );
     engine.start_tool(&job, tool).unwrap();
@@ -408,6 +411,7 @@ async fn mixed_queue_runs_internal_assignment_then_parks_old_user_until_resume()
             ))),
             covered: None,
             stream_items: vec![],
+            observations: ObservationLog::default().drain(),
         })
         .unwrap();
     assert_eq!(engine.state.jobs[&job].state, JobState::Paused);
@@ -891,6 +895,100 @@ fn cycles(engine: &Engine, job: &str, count: usize, bytes: usize) -> Vec<Event> 
     events
 }
 
+#[tokio::test]
+async fn length_recovery_reserves_its_fact_before_bounding_a_fresh_tool_result() {
+    let (directory, mut engine) = fixture_engine();
+    let script = directory.path().join("generation.json");
+    let requests = directory.path().join("requests.jsonl");
+    std::fs::write(&script, serde_json::to_vec(&json!({"turns":[
+        {"contains":["Incomplete readable tool preview"],"response_status":"incomplete","incomplete_reason":"max_output_tokens","text":"Unfinished answer"},
+        {"contains":["Incomplete readable tool preview","BONE RUNTIME FACT","None of its proposed tools or text were executed or delivered"],"text":"Bounded continuation"},
+    ]})).unwrap()).unwrap();
+    let (_server, port) =
+        generation_server::Server::script("tests/scripted_responses.py", &script, &requests);
+    let profile = Profile::from_model("openai:fixture")
+        .unwrap()
+        .with_endpoint(&format!("http://127.0.0.1:{port}/v1"))
+        .unwrap();
+    model::save_api_key(
+        &engine.data_dir,
+        "fixture",
+        &profile,
+        "synthetic-fixture-key",
+    )
+    .unwrap();
+    engine.set_profile(profile, "fixture".into()).unwrap();
+    engine.options.context_chars = 32_000;
+    let input = engine
+        .post("Verify the source; retain exact evidence.", None)
+        .unwrap();
+    engine.prepare_pending_input().unwrap();
+    let job = engine.state.focus.clone().unwrap();
+    let events = cycles(&engine, &job, 1, 512 * 1024);
+    let original_result = events[1].clone();
+    let mut state = engine.state.clone();
+    state
+        .jobs
+        .get_mut(&job)
+        .unwrap()
+        .history
+        .extend(events.iter().map(|event| event.id.clone()));
+    engine.commit(state, events).unwrap();
+
+    engine.start_model(&job).unwrap();
+    let done = tokio::time::timeout(Duration::from_secs(10), engine.tasks.join_next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    engine.complete(done).unwrap();
+    assert!(
+        engine.result(&input).is_none(),
+        "a limited answer must not be delivered"
+    );
+    assert!(engine.limited_generation(&input, "work").is_some());
+
+    engine.start_model(&job).unwrap();
+    assert_eq!(
+        engine.state.jobs[&job].state,
+        JobState::Running,
+        "the continuation fact must fit beside the bounded source preview"
+    );
+    let done = tokio::time::timeout(Duration::from_secs(10), engine.tasks.join_next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    engine.complete(done).unwrap();
+    let delivery = engine.result(&input).unwrap();
+    assert_eq!(delivery.kind, "delivery");
+    assert_eq!(engine.event_text(delivery).unwrap(), "Bounded continuation");
+    assert_eq!(engine.state.budgets[&input].calls_used, 2);
+    assert_eq!(
+        engine.read_event(&original_result.id).unwrap(),
+        original_result
+    );
+    let records: Vec<Value> = std::fs::read_to_string(requests)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        records.len(),
+        2,
+        "a fresh native result must not trigger a summary call"
+    );
+    let work_input = &records[1]["body"]["input"];
+    assert!(context::serialized_chars(work_input).unwrap() < engine.options.context_chars);
+    let sent = work_input.to_string();
+    assert!(sent.contains("BONE RUNTIME FACT"));
+    assert!(sent.contains("Incomplete readable tool preview"));
+    assert!(
+        !sent.contains(&"证".repeat(32_000)),
+        "the original result must stay in audit storage"
+    );
+}
+
 fn cache_bytes(engine: &Engine) -> usize {
     engine
         .events
@@ -998,6 +1096,7 @@ async fn thousands_of_large_events_stay_archived_across_repeated_summaries_and_r
                 abort: task.abort_handle(),
                 tool: None,
                 cancellation: None,
+                observations: None,
             },
         );
         engine
@@ -1009,6 +1108,7 @@ async fn thousands_of_large_events_stay_archived_across_repeated_summaries_and_r
                 )))),
                 covered: Some(covered),
                 stream_items: vec![],
+                observations: ObservationLog::default().drain(),
             })
             .unwrap();
         task.abort();
@@ -1113,7 +1213,7 @@ async fn completion_transaction_failure_poison_blocks_actions_and_restart_recove
         CallId::from_wire("write"),
         ToolFunction {
             name: ToolName::new("write_file").unwrap(),
-            arguments: json!({"path":"result","content":"one"}),
+            arguments: json!({"mode":"replace","path":"result","content":"one"}),
         },
     );
     let event = engine.event(&job,"model_message",json!({"response":native_response(Message::Assistant {id:None,content:vec![rig_core::completion::AssistantContent::ToolCall(call.clone())]})}));
@@ -1151,6 +1251,7 @@ async fn completion_transaction_failure_poison_blocks_actions_and_restart_recove
             abort: task.abort_handle(),
             tool: Some(tool.clone()),
             cancellation: None,
+            observations: None,
         },
     );
     let db = rusqlite::Connection::open(engine.data_dir.join("sessions.sqlite")).unwrap();

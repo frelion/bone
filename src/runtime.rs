@@ -10,8 +10,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail, ensure};
 use fs2::FileExt;
 use futures_util::StreamExt;
-use rig_core::completion::{CompletionRequest, CompletionResponse, Message};
+use rig_core::completion::{CompletionRequest, CompletionResponse, FinishReason, Message};
 use rig_core::message::ToolCall;
+use rig_core::observe::{
+    Action, AdapterContext, AdapterEvent, ObservationLog, ObservationTrace, Subject,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::task::{AbortHandle, JoinSet};
@@ -68,6 +71,7 @@ struct Running {
     abort: AbortHandle,
     tool: Option<PendingTool>,
     cancellation: Option<tokio::sync::watch::Sender<bool>>,
+    observations: Option<Arc<ObservationLog>>,
 }
 
 enum Completed {
@@ -76,6 +80,7 @@ enum Completed {
         response: Result<CompletionResponse>,
         covered: Option<Vec<String>>,
         stream_items: Vec<Value>,
+        observations: ObservationTrace,
     },
     Tool {
         origin: Origin,
@@ -532,12 +537,8 @@ impl Engine {
             let task = self.running.remove(&call).unwrap();
             task.abort.abort();
             state.jobs.get_mut(&task.origin.job).unwrap().current_call = None;
-            let mut event = self.event(
-                &task.origin.job,
-                "cancelled",
-                json!({"reason":"session stopped"}),
-            );
-            event.call_id = Some(task.origin.call);
+            let mut event = self.cancelled_model_event(&task, "session stopped");
+            event.kind = "cancelled".into();
             additions.push(event);
         }
         for job in state.jobs.values_mut() {
@@ -935,11 +936,30 @@ impl Engine {
             let job = state.jobs.get_mut(&running.origin.job).unwrap();
             job.current_call = None;
             job.state = JobState::Ready;
-            let mut event = self.event(&job.id, "model_cancelled", json!({"reason":reason}));
+            let mut event = self.cancelled_model_event(&running, reason);
             event.call_id = Some(id);
             events.push(event);
         }
         self.commit(state, events)
+    }
+
+    fn cancelled_model_event(&self, running: &Running, reason: &str) -> Event {
+        let mut data = running
+            .observations
+            .as_ref()
+            .map(|log| generation_diagnostic(None, &log.trace()))
+            .unwrap_or_else(|| json!({}));
+        data["reason"] = json!(reason);
+        data["purpose"] = self
+            .read_call_event(&running.origin.call, "model_started")
+            .ok()
+            .map(|e| e.data["purpose"].clone())
+            .unwrap_or(Value::Null);
+        let mut event = self.event(&running.origin.job, "model_cancelled", data);
+        event.call_id = Some(running.origin.call.clone());
+        event.reply_to = Some(running.origin.input.clone());
+        event.root_input = Some(running.origin.root.clone());
+        event
     }
 
     fn schedule(&mut self) -> Result<()> {
@@ -1238,26 +1258,78 @@ impl Engine {
         Ok(())
     }
 
-    fn start_model(&mut self, id: &str) -> Result<()> {
-        self.incorporate_public_inputs(id)?;
-        let input = self.state.jobs[id].active_input.clone().unwrap();
-        let root = self.root(&input)?;
-        let history = context::build_history(&self.state.jobs[id], &self.events)?;
-        let template = self.profile.apply(
+    /// Successful work and summary completions reset only their own phase.
+    /// Input identity survives handoff, revision changes, stop and restart.
+    fn limited_generation(&self, input: &str, purpose: &str) -> Option<&Event> {
+        for event in self
+            .records()
+            .rev()
+            .filter(|e| e.reply_to.as_deref() == Some(input))
+        {
+            if (purpose == "work" && event.kind == "model_message")
+                || (purpose == "summary" && event.kind == "summary")
+            {
+                return None;
+            }
+            if event.kind == "model_limited" && event.data["purpose"] == purpose {
+                return Some(event);
+            }
+        }
+        None
+    }
+
+    fn recovery_started(&self, limited: &Event) -> bool {
+        self.records().any(|event| {
+            event.kind == "model_started"
+                && event.data["recovery_of"].as_str() == limited.call_id.as_deref()
+        })
+    }
+
+    fn work_template(&self, id: &str) -> Result<CompletionRequest> {
+        Ok(self.profile.apply(
             CompletionRequest::from(Vec::<Message>::new())
                 .preamble(self.preamble(id)?)
                 .tools(tools::definitions(
                     self.options.single_job,
                     self.options.read_only,
                 )),
-        );
+        ))
+    }
+
+    fn start_model(&mut self, id: &str) -> Result<()> {
+        self.incorporate_public_inputs(id)?;
+        let input = self.state.jobs[id].active_input.clone().unwrap();
+        let root = self.root(&input)?;
+        let limited_work = self.limited_generation(&input, "work").cloned();
+        if limited_work.as_ref().is_some_and(|event| {
+            self.recovery_started(event) || event.data["retry_allowed"] == false
+        }) {
+            self.fail(id, "generation remained incomplete after the single continuation attempt; existing progress is preserved")?;
+            return Ok(());
+        }
+        let mut history = context::build_history(&self.state.jobs[id], &self.events)?;
+        let continuation_fact = limited_work.as_ref().map(|event| Message::user(format!(
+                "[BONE RUNTIME FACT call={}] The previous generation reached a provider limit and was not accepted. None of its proposed tools or text were executed or delivered. Earlier committed tool results remain valid; do not repeat those actions. Continue the ACTIVE input under the latest instructions. Choose smaller complete actions: for long files, create a complete first portion with write_file mode=replace, then append complete portions using the latest returned SHA. Do not reconstruct or splice unfinished tool arguments. The configured generation settings and shared task allowance are unchanged.",
+                event.call_id.as_deref().unwrap_or("unknown")
+            )));
+        if let Some(message) = &continuation_fact {
+            history.push(message.clone());
+        }
+        let template = self.work_template(id)?;
         let overhead = context::serialized_chars(&template)?;
-        let history_budget = self.options.context_chars.saturating_sub(overhead + 64);
+        let continuation_chars = continuation_fact
+            .as_ref()
+            .map(context::serialized_chars)
+            .transpose()?
+            .unwrap_or(0);
+        let history_budget = self
+            .options
+            .context_chars
+            .saturating_sub(overhead + continuation_chars + 64);
         let summary_preamble = context::SUMMARY_PREAMBLE;
         let mut summary_template = self
             .profile
             .apply(CompletionRequest::from(Vec::<Message>::new()).preamble(summary_preamble));
-        summary_template.max_tokens = Some(summary_template.max_tokens.unwrap_or(2048).min(2048));
         summary_template.tools.clear();
         summary_template.tool_choice = None;
         if let Some(params) = summary_template
@@ -1284,7 +1356,31 @@ impl Engine {
         }
         let mut request = template.clone();
         request.chat_history.extend(history);
-        let compact = if context::serialized_chars(&request)? > self.options.context_chars {
+        let limited_summary = self.limited_generation(&input, "summary").cloned();
+        let compact = if let Some(event) = &limited_summary {
+            if self.recovery_started(event) || event.data["retry_allowed"] == false {
+                self.fail(id, "summary generation remained incomplete after the single smaller-prefix attempt; original history and previous summary are preserved")?;
+                return Ok(());
+            }
+            let failed = self.read_event(&event.id)?;
+            let covered: Vec<String> = serde_json::from_value(failed.data["covered_ids"].clone())?;
+            let source_chars = failed.data["source_chars"]
+                .as_u64()
+                .context("limited summary has no source size")?
+                as usize;
+            match context::smaller_compaction_prefix(
+                &self.state.jobs[id],
+                &self.events,
+                &covered,
+                source_chars,
+            )? {
+                Some(prefix) => Some(prefix),
+                None => {
+                    self.fail(id, "summary reached a generation limit and no smaller complete source prefix fits; original history and previous summary are preserved")?;
+                    return Ok(());
+                }
+            }
+        } else if context::serialized_chars(&request)? > self.options.context_chars {
             if self.options.no_compaction {
                 self.fail(id, "context limit reached with compaction disabled")?;
                 return Ok(());
@@ -1305,6 +1401,7 @@ impl Engine {
                         Some(history) => {
                             request = template.clone();
                             request.chat_history.extend(history);
+                            request.chat_history.extend(continuation_fact.clone());
                             None
                         }
                         None => {
@@ -1317,6 +1414,10 @@ impl Engine {
         } else {
             None
         };
+        let source_chars = compact
+            .as_ref()
+            .map(|(messages, _)| context::serialized_chars(messages))
+            .transpose()?;
         let covered = if let Some((messages, covered)) = compact {
             request = summary_template;
             request.chat_history.extend(messages);
@@ -1352,7 +1453,23 @@ impl Engine {
         let job = state.jobs.get_mut(id).unwrap();
         job.state = JobState::Running;
         job.current_call = Some(origin.call.clone());
-        let mut event=self.event(id,"model_started",json!({"purpose":if covered.is_some(){"summary"}else{"work"},"profile":self.profile_name}));
+        let purpose = if covered.is_some() { "summary" } else { "work" };
+        let recovery = if covered.is_some() {
+            limited_summary.as_ref()
+        } else {
+            limited_work.as_ref()
+        };
+        let mut event = self.event(
+            id,
+            "model_started",
+            json!({
+                "purpose":purpose,"profile":self.profile_name,
+                "requested_model":request.model.as_deref().or_else(|| self.profile.model_name()),
+                "configured_generation":configured_generation(&request),
+                "source_chars":source_chars,
+                "recovery_of":recovery.and_then(|event|event.call_id.as_deref())
+            }),
+        );
         event.call_id = Some(origin.call.clone());
         self.commit(state, vec![event])?;
         let profile = self.profile.clone();
@@ -1360,10 +1477,16 @@ impl Engine {
         let name = self.profile_name.clone();
         let task_origin = origin.clone();
         let progress = Arc::clone(&self.model_progress);
-        let purpose = if covered.is_some() { "summary" } else { "work" };
         let timeout = self.options.model_timeout_seconds;
+        let log = Arc::new(ObservationLog::ring(256));
+        let task_log = Arc::clone(&log);
         let abort = self.tasks.spawn(async move {
             let mut stream_items = Vec::new();
+            let observation = AdapterContext::new(
+                task_log.clone(),
+                Subject::scoped(&task_origin.job),
+                &task_origin.call,
+            );
             let response = async {
                 let prepared = model::prepare(
                     &profile,
@@ -1377,7 +1500,7 @@ impl Engine {
                     let connection = prepared.connect().await?;
                     let mut stream = connection
                         .model
-                        .stream(request)
+                        .stream_observed(request, observation)
                         .map_err(|e| model::call_error_for_profile(&profile, &name, e))?;
                     let mut bytes = 0_usize;
                     while let Some(item) = stream.next().await {
@@ -1408,6 +1531,7 @@ impl Engine {
                 response,
                 covered,
                 stream_items,
+                observations: task_log.drain(),
             }
         });
         self.running.insert(
@@ -1417,6 +1541,7 @@ impl Engine {
                 abort,
                 tool: None,
                 cancellation: None,
+                observations: Some(log),
             },
         );
         Ok(())
@@ -1502,6 +1627,7 @@ impl Engine {
                 abort,
                 tool: Some(tool),
                 cancellation: Some(cancellation),
+                observations: None,
             },
         );
         Ok(())
@@ -1514,7 +1640,10 @@ impl Engine {
                 response,
                 covered,
                 stream_items,
+                observations,
             } => {
+                let purpose = if covered.is_some() { "summary" } else { "work" };
+                let diagnostic = generation_diagnostic(response.as_ref().ok(), &observations);
                 let stale = self.running.remove(&origin.call).is_none()
                     || origin.revision != self.state.revision
                     || self.state.paused;
@@ -1533,61 +1662,120 @@ impl Engine {
                 }
                 if stale {
                     let mut events = Vec::new();
-                    if let Ok(response) = response {
-                        let mut event =
-                            self.event(&origin.job, "stale", json!({"response":response}));
-                        event.call_id = Some(origin.call);
-                        event.root_input = Some(origin.root);
-                        events.push(event);
+                    let mut data = diagnostic;
+                    data["purpose"] = json!(purpose);
+                    match response {
+                        Ok(response) => data["response"] = json!(response),
+                        Err(error) => data["error"] = json!(format!("{error:#}")),
                     }
+                    let mut event = self.event(&origin.job, "stale", data);
+                    event.call_id = Some(origin.call);
+                    event.reply_to = Some(origin.input);
+                    event.root_input = Some(origin.root);
+                    events.push(event);
                     self.commit(state, events)?;
                     return Ok(());
                 }
-                self.commit(state, Vec::new())?;
                 let response = match response {
                     Ok(response) => response,
                     Err(error) => {
-                        let mut event = self.event(
-                            &origin.job,
-                            "model_failed",
-                            json!({"error":format!("{error:#}"),"stream_items":stream_items}),
-                        );
+                        let error = if explicit_context_limit(&observations) {
+                            format!(
+                                "model context limit reached; existing progress and original history are preserved: {error:#}"
+                            )
+                        } else {
+                            format!("{error:#}")
+                        };
+                        let mut data = diagnostic;
+                        data["purpose"] = json!(purpose);
+                        data["error"] = json!(error);
+                        data["stream_items"] = json!(stream_items);
+                        let mut event = self.event(&origin.job, "model_failed", data);
                         event.call_id = Some(origin.call);
-                        self.commit(self.state.clone(), vec![event])?;
-                        self.fail(&origin.job, &format!("{error:#}"))?;
+                        self.commit(state, vec![event])?;
+                        self.fail(&origin.job, &error)?;
                         return Ok(());
                     }
                 };
-                if response
-                    .finish_reason()
-                    .is_some_and(|r| r.truncated_output())
-                {
-                    let mut event = self.event(
-                        &origin.job,
-                        "model_failed",
-                        json!({"response":response,"error":"truncated output"}),
-                    );
+                let rejection = if explicit_context_limit(&observations) {
+                    Some("model context limit reached; existing progress and original history are preserved".to_owned())
+                } else {
+                    match response.finish_reason() {
+                        Some(FinishReason::Length) => {
+                            let prior = self.limited_generation(&origin.input, purpose);
+                            let retry_allowed = prior.is_none();
+                            let started = self.read_call_event(&origin.call, "model_started")?;
+                            let mut data = diagnostic;
+                            data["purpose"] = json!(purpose);
+                            data["response"] = json!(response);
+                            data["reason"] = json!("length");
+                            data["retry_allowed"] = json!(retry_allowed);
+                            data["covered_ids"] = json!(covered);
+                            data["source_chars"] = started.data["source_chars"].clone();
+                            let mut event = self.event(&origin.job, "model_limited", data);
+                            event.call_id = Some(origin.call);
+                            self.commit(state, vec![event])?;
+                            if !retry_allowed {
+                                self.fail(&origin.job, if purpose == "summary" {
+                                    "summary generation remained incomplete after the single smaller-prefix attempt; original history and previous summary are preserved"
+                                } else {
+                                    "generation remained incomplete after the single continuation attempt; no proposal from either incomplete generation was executed, and existing progress is preserved"
+                                })?;
+                            }
+                            return Ok(());
+                        }
+                        Some(FinishReason::ContentFilter) => Some("provider filtered the generation; this proposal was not executed, and existing progress is preserved".into()),
+                        Some(FinishReason::Other(reason)) => Some(format!("provider ended generation with {reason}; this proposal was not accepted, and existing progress is preserved")),
+                        Some(FinishReason::Stop | FinishReason::ToolCalls) | None => None,
+                    }
+                };
+                if let Some(error) = rejection {
+                    let mut data = diagnostic;
+                    data["purpose"] = json!(purpose);
+                    data["response"] = json!(response);
+                    data["error"] = json!(error);
+                    let mut event = self.event(&origin.job, "model_failed", data);
                     event.call_id = Some(origin.call);
-                    self.commit(self.state.clone(), vec![event])?;
-                    self.fail(
-                        &origin.job,
-                        "model output was truncated; no proposed tools were executed",
-                    )?;
+                    self.commit(state, vec![event])?;
+                    self.fail(&origin.job, &error)?;
                     return Ok(());
                 }
                 if let Some(covered) = covered {
-                    ensure!(
-                        response.tool_calls().next().is_none(),
-                        "summary unexpectedly requested a tool"
-                    );
-                    if response.text().trim().is_empty() {
-                        self.fail(&origin.job, "summary returned no text")?;
+                    let previous = self.state.jobs[&origin.job].summary.clone();
+                    let mut data = diagnostic;
+                    data["purpose"] = json!(purpose);
+                    data["response"] = json!(response);
+                    data["covered_ids"] = json!(covered);
+                    data["previous_summary"] = json!(previous);
+                    let mut event = self.event(&origin.job, "summary", data);
+                    event.call_id = Some(origin.call);
+                    let summary_error = if response.tool_calls().next().is_some() {
+                        Some(
+                            "summary unexpectedly requested a tool; original history and previous summary are preserved",
+                        )
+                    } else if response.text().trim().is_empty() {
+                        Some(
+                            "summary returned no text; original history and previous summary are preserved",
+                        )
+                    } else if !context::summary_shrinks_work(
+                        &self.state.jobs[&origin.job],
+                        &self.events,
+                        &event,
+                        &self.work_template(&origin.job)?,
+                    )? {
+                        Some(
+                            "summary did not reduce the work request; original history and previous summary are preserved",
+                        )
+                    } else {
+                        None
+                    };
+                    if let Some(error) = summary_error {
+                        event.kind = "model_failed".into();
+                        event.data["error"] = json!(error);
+                        self.commit(state, vec![event])?;
+                        self.fail(&origin.job, error)?;
                         return Ok(());
                     }
-                    let previous = self.state.jobs[&origin.job].summary.clone();
-                    let mut event=self.event(&origin.job,"summary",json!({"response":response,"covered_ids":covered,"previous_summary":previous}));
-                    event.call_id = Some(origin.call);
-                    let mut state = self.state.clone();
                     let job = state.jobs.get_mut(&origin.job).unwrap();
                     let covered: BTreeSet<_> = covered.into_iter().collect();
                     job.history.retain(|id| {
@@ -1605,11 +1793,28 @@ impl Engine {
                         .tool_calls()
                         .any(|call| tools::is_control(call.function.name.as_str()));
                 let text = response.text();
-                let mut event =
-                    self.event(&origin.job, "model_message", json!({"response":response}));
+                let mut data = diagnostic;
+                data["purpose"] = json!(purpose);
+                data["response"] = json!(response);
+                if call_count == 0 && text.trim().is_empty() {
+                    let error = "model returned neither an answer nor a tool call; existing progress is preserved";
+                    data["error"] = json!(error);
+                    let mut event = self.event(&origin.job, "model_failed", data);
+                    event.call_id = Some(origin.call);
+                    self.commit(state, vec![event])?;
+                    self.fail(&origin.job, error)?;
+                    return Ok(());
+                }
+                let mut event = self.event(&origin.job, "model_message", data);
                 event.call_id = Some(origin.call.clone());
                 let response_event = event.id.clone();
-                self.append_history(&origin.job, event)?;
+                state
+                    .jobs
+                    .get_mut(&origin.job)
+                    .unwrap()
+                    .history
+                    .push(event.id.clone());
+                self.commit(state, vec![event])?;
                 self.admit_input(&origin.job, &origin.input)?;
                 if invalid_batch {
                     for pending in self.pending_tools(&origin.job)? {
@@ -1617,38 +1822,31 @@ impl Engine {
                         self.append_history(&origin.job, event)?;
                     }
                 } else if call_count == 0 {
-                    if text.trim().is_empty() {
-                        self.fail(
-                            &origin.job,
-                            "model returned neither an answer nor a tool call",
-                        )?;
-                    } else {
-                        let outstanding = self
-                            .state
-                            .jobs
-                            .values()
-                            .filter(|j| j.id != origin.job)
-                            .flat_map(|j| j.active_input.iter().chain(j.inbox.iter()))
-                            .filter(|input| {
-                                self.events.get(*input).is_some_and(|e| {
-                                    e.data["sender_input"].as_str() == Some(&origin.input)
-                                }) && self.terminal(input).is_none()
-                            })
-                            .cloned()
-                            .collect::<Vec<_>>();
-                        if !outstanding.is_empty() {
-                            let mut state = self.state.clone();
-                            let job = state.jobs.get_mut(&origin.job).unwrap();
-                            job.state = JobState::Waiting;
-                            job.wait_for = outstanding;
-                            if has_wait_cycle(&state, |input| self.terminal(input).is_some()) {
-                                self.fail(&origin.job, "finishing this input would create a job dependency cycle; resolve the pending assignments first")?;
-                            } else {
-                                self.commit(state, Vec::new())?;
-                            }
+                    let outstanding = self
+                        .state
+                        .jobs
+                        .values()
+                        .filter(|j| j.id != origin.job)
+                        .flat_map(|j| j.active_input.iter().chain(j.inbox.iter()))
+                        .filter(|input| {
+                            self.events.get(*input).is_some_and(|e| {
+                                e.data["sender_input"].as_str() == Some(&origin.input)
+                            }) && self.terminal(input).is_none()
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if !outstanding.is_empty() {
+                        let mut state = self.state.clone();
+                        let job = state.jobs.get_mut(&origin.job).unwrap();
+                        job.state = JobState::Waiting;
+                        job.wait_for = outstanding;
+                        if has_wait_cycle(&state, |input| self.terminal(input).is_some()) {
+                            self.fail(&origin.job, "finishing this input would create a job dependency cycle; resolve the pending assignments first")?;
                         } else {
-                            self.deliver(&origin.job, &response_event)?;
+                            self.commit(state, Vec::new())?;
                         }
+                    } else {
+                        self.deliver(&origin.job, &response_event)?;
                     }
                 }
             }
@@ -1960,11 +2158,7 @@ impl Engine {
                         job.current_call = None;
                         job.active_input = None;
                         job.state = self.queued_state(job);
-                        let mut event = self.event(
-                            &origin.job,
-                            "model_cancelled",
-                            json!({"reason":"input superseded"}),
-                        );
+                        let mut event = self.cancelled_model_event(running, "input superseded");
                         event.call_id = Some(call.clone());
                         event.reply_to = Some(origin.input.clone());
                         event.root_input = Some(origin.root.clone());
@@ -2552,6 +2746,109 @@ impl Drop for Engine {
             running.abort.abort();
         }
     }
+}
+
+/// Only generation parameters are projected; arbitrary extension fields can
+/// carry user metadata or credentials and do not belong in diagnostics.
+fn configured_generation(request: &CompletionRequest) -> Value {
+    let mut params = serde_json::Map::new();
+    if let Some(extra) = request
+        .additional_params
+        .as_ref()
+        .and_then(Value::as_object)
+    {
+        for key in [
+            "max_tokens",
+            "max_output_tokens",
+            "max_completion_tokens",
+            "temperature",
+            "top_p",
+            "top_k",
+            "reasoning_effort",
+        ] {
+            if let Some(value) = extra
+                .get(key)
+                .filter(|v| v.is_number() || v.is_string() || v.is_null())
+            {
+                let value = if let Some(text) = value.as_str() {
+                    json!(rig_core::observe::scrub_diagnostic(text, &[]))
+                } else {
+                    value.clone()
+                };
+                params.insert(key.into(), value);
+            }
+        }
+        for key in ["reasoning", "thinking"] {
+            if let Some(extra) = extra.get(key).and_then(Value::as_object) {
+                let mut selected = serde_json::Map::new();
+                for field in ["effort", "summary", "type", "budget_tokens", "max_tokens"] {
+                    if let Some(value) = extra
+                        .get(field)
+                        .filter(|v| v.is_number() || v.is_string() || v.is_null())
+                    {
+                        let value = if let Some(text) = value.as_str() {
+                            json!(rig_core::observe::scrub_diagnostic(text, &[]))
+                        } else {
+                            value.clone()
+                        };
+                        selected.insert(field.into(), value);
+                    }
+                }
+                params.insert(key.into(), Value::Object(selected));
+            }
+        }
+    }
+    json!({"max_tokens":request.max_tokens,"temperature":request.temperature,"additional_params":params})
+}
+
+fn explicit_context_limit(trace: &ObservationTrace) -> bool {
+    let context_code = |code: &str| {
+        matches!(
+            code,
+            "model_length" | "model_context_window_exceeded" | "context_length_exceeded"
+        )
+    };
+    trace
+        .observations
+        .iter()
+        .any(|observation| match &observation.action {
+            Action::Adapter { observation } => match &observation.event {
+                AdapterEvent::Provider { verdict } => {
+                    verdict.finish_reason.as_deref().is_some_and(context_code)
+                        || verdict.detail.as_deref().is_some_and(context_code)
+                }
+                AdapterEvent::ErrorEnvelope { error } => {
+                    error.code.as_deref().is_some_and(context_code)
+                }
+                _ => false,
+            },
+            _ => false,
+        })
+}
+
+fn generation_diagnostic(response: Option<&CompletionResponse>, trace: &ObservationTrace) -> Value {
+    let usage = trace
+        .observations
+        .iter()
+        .rev()
+        .find_map(|observation| match &observation.action {
+            Action::Adapter { observation } => match &observation.event {
+                AdapterEvent::Usage { usage } => Some(usage),
+                _ => None,
+            },
+            _ => None,
+        });
+    let reported_cap = response
+        .and_then(|r| r.raw.get("max_output_tokens"))
+        .and_then(Value::as_u64);
+    // Native response usage is authoritative when present. A failed native fold
+    // can still have reported usage in the provider observation.
+    json!({
+        "finish_reason":response.and_then(CompletionResponse::finish_reason),
+        "usage":response.map(|r| json!(r.usage)).unwrap_or_else(||json!(usage)),
+        "provider_reported":{"usage":usage,"max_output_tokens":reported_cap},
+        "observations":trace
+    })
 }
 
 fn has_wait_cycle(state: &SessionState, is_terminal: impl Fn(&str) -> bool) -> bool {

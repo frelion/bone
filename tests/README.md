@@ -30,6 +30,7 @@ Rust 回归和 PTY 测试使用本地服务、合成凭据与临时工作区。�
 | `question_routing.rs` | 内部 Job 提问、普通回答、chat 截止与恢复 |
 | `long_session.rs`、`oversized_context.rs` | 多轮压缩、跨进程续接、长结果、共享约束与冷历史 |
 | `engineering_cli.rs` | 工具元数据的被动入口、实际只读搜索、Rig 原生环境接入 |
+| `generation_limits.rs` | Rig 原生受限/过滤/未知/断流终态、零提案执行、有界续做、工作与摘要机会隔离、停止/重启、append 跨进程 |
 | `tui_pty.py` | 真实终端按键、流、打断、编辑器 stdin、信号退出和终端恢复 |
 | `test_ablate.py`、`test_export_trace.py` | 失败/未知用量统计、外部判定与分享报告脱敏 |
 | `support/`、`scripted_responses.py` | 具体的本地测试支架；不包含产品逻辑或场景判定 |

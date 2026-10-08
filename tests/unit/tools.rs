@@ -55,8 +55,9 @@ fn shell_timeout_schema_matches_runtime_limits() {
 #[tokio::test]
 async fn replacements_require_matching_content() {
     let dir = tempfile::tempdir().unwrap();
-    let create = json!({"path":"x","content":"one","expected_sha256":null});
-    let replace = json!({"path":"x","content":"two","expected_sha256":sha256(b"one")});
+    let create = json!({"mode":"replace","path":"x","content":"one","expected_sha256":null});
+    let replace =
+        json!({"mode":"replace","path":"x","content":"two","expected_sha256":sha256(b"one")});
     for (args, succeeds) in [(&create, true), (&create, false), (&replace, true)] {
         let outcome = execute(dir.path(), "write_file", args, None).await;
         assert_eq!(outcome.content.get("error").is_none(), succeeds);
@@ -66,11 +67,179 @@ async fn replacements_require_matching_content() {
         "two"
     );
 }
+
+#[tokio::test]
+async fn append_builds_a_long_file_from_fragments_with_result_hashes() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = "重复内容\r\n".repeat(1024);
+    let mut expected = first.clone();
+    let mut result = execute(
+        dir.path(),
+        "write_file",
+        &json!({"mode":"replace","path":"long.txt","content":first,"expected_sha256":null}),
+        None,
+    )
+    .await;
+    for fragment in [first.as_str(), "最后一段\n", ""] {
+        assert!(result.content.get("error").is_none());
+        assert!(!result.uncertain);
+        result = execute(
+            dir.path(),
+            "write_file",
+            &json!({"mode":"append","path":"long.txt","content":fragment,"expected_sha256":result.content["sha256"]}),
+            None,
+        )
+        .await;
+        expected.push_str(fragment);
+        assert!(result.content.get("error").is_none());
+        assert_eq!(result.content["bytes"], expected.len());
+        assert_eq!(result.content["sha256"], sha256(expected.as_bytes()));
+        assert_eq!(
+            std::fs::read(dir.path().join("long.txt")).unwrap(),
+            expected.as_bytes()
+        );
+    }
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn write_requires_explicit_mode_and_append_requires_the_existing_hash() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("existing"), "original").unwrap();
+    for (args, error) in [
+        (
+            json!({"path":"existing","content":"replacement","expected_sha256":sha256(b"original")}),
+            "mode",
+        ),
+        (
+            json!({"mode":"other","path":"existing","content":"replacement","expected_sha256":sha256(b"original")}),
+            "mode must be",
+        ),
+        (
+            json!({"mode":"append","path":"missing","content":"fragment","expected_sha256":null}),
+            "append requires",
+        ),
+        (
+            json!({"mode":"append","path":"existing","content":"fragment","expected_sha256":null}),
+            "append requires",
+        ),
+        (
+            json!({"mode":"append","path":"existing","content":"fragment","expected_sha256":"stale"}),
+            "file changed",
+        ),
+    ] {
+        assert_rejected(&write_file(dir.path(), &args, |_| Ok(())), error);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("existing")).unwrap(),
+            "original"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+    let definition = definitions(true, false)
+        .into_iter()
+        .find(|tool| tool.name.as_str() == "write_file")
+        .unwrap();
+    assert!(
+        definition.parameters["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("mode"))
+    );
+    assert_eq!(
+        definition.parameters["properties"]["mode"]["enum"],
+        json!(["replace", "append"])
+    );
+}
+
+#[test]
+fn append_rechecks_original_content_and_identity_before_installing() {
+    for identical_content in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file");
+        std::fs::write(&path, "original").unwrap();
+        let external = if identical_content {
+            "original"
+        } else {
+            "editor save"
+        };
+        let result = write_file_prepared(
+            dir.path(),
+            &json!({"mode":"append","path":"file","content":" fragment","expected_sha256":sha256(b"original")}),
+            |_| Ok(()),
+            |path| {
+                if identical_content {
+                    let replacement = path.with_extension("editor-save");
+                    std::fs::write(&replacement, external)?;
+                    std::fs::rename(replacement, path)?;
+                } else {
+                    std::fs::write(path, external)?;
+                }
+                Ok(())
+            },
+        );
+        assert_rejected(&result, "changed during");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), external);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+}
+
+#[test]
+fn append_directory_sync_failure_preserves_progress_and_rejects_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("file"), "original").unwrap();
+    let args = json!({"mode":"append","path":"file","content":" fragment","expected_sha256":sha256(b"original")});
+    let result = write_file(dir.path(), &args, |_| {
+        Err(std::io::Error::other("injected directory sync failure"))
+    });
+    assert_installed_but_uncertain(&result, dir.path(), "file", "original fragment");
+    assert_rejected(&write_file(dir.path(), &args, |_| Ok(())), "file changed");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("file")).unwrap(),
+        "original fragment"
+    );
+}
+
+#[test]
+fn append_checks_the_entire_result_against_the_file_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let contents = vec![b'x'; FILE_LIMIT as usize];
+    std::fs::write(dir.path().join("file"), &contents).unwrap();
+    let result = write_file(
+        dir.path(),
+        &json!({"mode":"append","path":"file","content":"x","expected_sha256":sha256(&contents)}),
+        |_| Ok(()),
+    );
+    assert_rejected(&result, "resulting file exceeds 16 MiB");
+    assert_eq!(std::fs::read(dir.path().join("file")).unwrap(), contents);
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn append_preserves_existing_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("file");
+    std::fs::write(&path, "original").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o751)).unwrap();
+    let result = write_file(
+        dir.path(),
+        &json!({"mode":"append","path":"file","content":" fragment","expected_sha256":sha256(b"original")}),
+        |_| Ok(()),
+    );
+    assert!(result.content.get("error").is_none());
+    assert_eq!(
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+        0o751
+    );
+}
+
 #[test]
 fn directory_sync_failure_preserves_unknown_outcome_after_replacement() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("x"), "old").unwrap();
-    let args = json!({"path":"x","content":"new","expected_sha256":sha256(b"old")});
+    let args =
+        json!({"mode":"replace","path":"x","content":"new","expected_sha256":sha256(b"old")});
     let out = write_file(dir.path(), &args, |_| {
         Err(std::io::Error::other("injected directory sync failure"))
     });
@@ -127,7 +296,7 @@ fn assert_raced_write(before_install: impl FnOnce(&Path) -> Result<()>, expected
     std::fs::write(&path, "original").unwrap();
     let outcome = write_file_prepared(
         directory.path(),
-        &json!({"path":"source.py","content":"agent replacement","expected_sha256":sha256(b"original")}),
+        &json!({"mode":"replace","path":"source.py","content":"agent replacement","expected_sha256":sha256(b"original")}),
         |_| Ok(()),
         before_install,
     );
@@ -167,7 +336,7 @@ fn new_file_creation_does_not_replace_a_target_created_during_preparation() {
     let path = directory.path().join("new.py");
     let outcome = write_file_prepared(
         directory.path(),
-        &json!({"path":"new.py","content":"agent content","expected_sha256":null}),
+        &json!({"mode":"replace","path":"new.py","content":"agent content","expected_sha256":null}),
         |_| Ok(()),
         |path| {
             std::fs::write(path, "external new file")?;
@@ -185,7 +354,7 @@ fn new_file_directory_sync_failure_is_unknown_after_the_atomic_create() {
     let directory = tempfile::tempdir().unwrap();
     let outcome = write_file(
         directory.path(),
-        &json!({"path":"new.py","content":"new content","expected_sha256":null}),
+        &json!({"mode":"replace","path":"new.py","content":"new content","expected_sha256":null}),
         |_| Err(std::io::Error::other("injected directory sync failure")),
     );
     assert_installed_but_uncertain(&outcome, directory.path(), "new.py", "new content");
@@ -201,7 +370,7 @@ fn write_hash_rejects_an_oversized_existing_file_before_loading_it() {
         .unwrap();
     let outcome = write_file(
         directory.path(),
-        &json!({"path":"growing.log","content":"replacement","expected_sha256":"previous-hash"}),
+        &json!({"mode":"replace","path":"growing.log","content":"replacement","expected_sha256":"previous-hash"}),
         |_| Ok(()),
     );
     assert_rejected(&outcome, "16 MiB");
