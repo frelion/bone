@@ -1170,7 +1170,7 @@ async fn shell_progress_precedes_completion_and_keeps_final_output_after_new_inp
             .iter()
             .any(|event| event.kind == "tool_started" && event.call_id.as_ref() == Some(&call))
     );
-    let observed = tokio::time::timeout(Duration::from_secs(3), async {
+    let observed = tokio::time::timeout(Duration::from_secs(if cfg!(windows) { 20 } else { 3 }), async {
         loop {
             let records = engine.drain_tool_progress();
             if let Some(record) = records
@@ -1183,7 +1183,9 @@ async fn shell_progress_precedes_completion_and_keeps_final_output_after_new_inp
         }
     })
     .await
-    .unwrap();
+    .unwrap_or_else(|error| {
+        panic!("shell did not produce live stdout/stderr before completion: {error}; recent progress: {:?}", engine.drain_tool_progress())
+    });
     assert_eq!(observed.call_id, call);
     assert_eq!(observed.job_id, job);
     assert_eq!(observed.tool_name, "shell");

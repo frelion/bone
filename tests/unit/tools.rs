@@ -111,7 +111,7 @@ fn traversal_and_symlink_escapes_are_rejected() {
 async fn shell_output_is_bounded_and_nonzero_exit_is_reported() {
     let dir = tempfile::tempdir().unwrap();
     let command = if cfg!(windows) {
-        "<nul set /p =test & exit /b 7"
+        "<nul set /p =test& exit /b 7"
     } else {
         "printf test; exit 7"
     };
@@ -374,10 +374,10 @@ async fn windows_timeout_stops_descendants_before_releasing_workspace_ownership(
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(
         directory.path().join("child.ps1"),
-        "Start-Sleep -Seconds 3; Set-Content child.finished finished",
+        "Set-Content child.started ready; while (!(Test-Path release)) { Start-Sleep -Milliseconds 10 }; Set-Content child.finished finished",
     )
     .unwrap();
-    std::fs::write(directory.path().join("parent.ps1"), "Start-Process powershell.exe -ArgumentList '-NoProfile','-NonInteractive','-File','child.ps1' -NoNewWindow; Set-Content shell.started ready; Start-Sleep -Seconds 20").unwrap();
+    std::fs::write(directory.path().join("parent.ps1"), "Start-Process powershell.exe -ArgumentList '-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File','child.ps1' -NoNewWindow; while (!(Test-Path child.started)) { Start-Sleep -Milliseconds 10 }; Set-Content shell.started ready; Start-Sleep -Seconds 60").unwrap();
     let open_lock = |name| {
         std::sync::Arc::new(
             std::fs::OpenOptions::new()
@@ -392,12 +392,17 @@ async fn windows_timeout_stops_descendants_before_releasing_workspace_ownership(
     let legacy = open_lock("legacy.lock");
     stable.try_lock_exclusive().unwrap();
     legacy.try_lock_exclusive().unwrap();
-    let outcome = execute(directory.path(), "shell", &json!({"command":"powershell.exe -NoProfile -NonInteractive -File parent.ps1","timeout_seconds":2}), Some([stable.clone(), legacy.clone()])).await;
-    assert!(directory.path().join("shell.started").exists());
+    let outcome = execute(directory.path(), "shell", &json!({"command":"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File parent.ps1","timeout_seconds":15}), Some([stable.clone(), legacy.clone()])).await;
+    assert!(
+        directory.path().join("shell.started").exists(),
+        "Windows parent/descendant did not reach ready: {}",
+        outcome.content
+    );
     assert!(outcome.uncertain);
     assert_eq!(outcome.content["effect"], "unknown");
     crate::windows::ensure_writer_stopped(&stable).unwrap();
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    std::fs::write(directory.path().join("release"), "").unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
     assert!(
         !directory.path().join("child.finished").exists(),
         "timed-out descendant continued writing"
@@ -423,7 +428,8 @@ fn windows_owned_shell_helper() {
     let legacy = open("legacy.lock");
     stable.try_lock_exclusive().unwrap();
     legacy.try_lock_exclusive().unwrap();
-    tokio::runtime::Runtime::new().unwrap().block_on(execute(&directory, "shell", &json!({"command":"powershell.exe -NoProfile -NonInteractive -File parent.ps1","timeout_seconds":20}), Some([stable, legacy])));
+    let outcome = tokio::runtime::Runtime::new().unwrap().block_on(execute(&directory, "shell", &json!({"command":"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File parent.ps1","timeout_seconds":60}), Some([stable, legacy])));
+    println!("Windows owned-shell outcome: {}", outcome.content);
 }
 
 #[cfg(windows)]
@@ -431,7 +437,7 @@ fn windows_owned_shell_helper() {
 fn windows_killed_parent_stops_the_shell_and_keeps_recovery_blocked_until_it_stops() {
     use fs2::FileExt;
     let directory = tempfile::tempdir().unwrap();
-    std::fs::write(directory.path().join("parent.ps1"), "Set-Content shell.started ready; Start-Sleep -Seconds 3; Set-Content shell.finished finished").unwrap();
+    std::fs::write(directory.path().join("parent.ps1"), "Set-Content shell.started ready; while (!(Test-Path release)) { Start-Sleep -Milliseconds 10 }; Set-Content shell.finished finished").unwrap();
     let open = |name| {
         std::fs::OpenOptions::new()
             .read(true)
@@ -442,6 +448,7 @@ fn windows_killed_parent_stops_the_shell_and_keeps_recovery_blocked_until_it_sto
     };
     let stable = open("stable.lock");
     let _legacy = open("legacy.lock");
+    let helper_log = std::fs::File::create(directory.path().join("helper.log")).unwrap();
     let mut parent = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -450,16 +457,25 @@ fn windows_killed_parent_stops_the_shell_and_keeps_recovery_blocked_until_it_sto
             "--nocapture",
         ])
         .env("BONE_TOOL_LEASE_TEST_DIR", directory.path())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(helper_log.try_clone().unwrap())
+        .stderr(helper_log)
         .spawn()
         .unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while !directory.path().join("shell.started").exists() {
         if std::time::Instant::now() >= deadline {
             let _ = parent.kill();
             let _ = parent.wait();
-            panic!("Windows shell helper did not start");
+            panic!(
+                "Windows shell helper did not start: {}",
+                std::fs::read_to_string(directory.path().join("helper.log")).unwrap()
+            );
+        }
+        if let Some(status) = parent.try_wait().unwrap() {
+            panic!(
+                "Windows shell helper exited before readiness ({status}): {}",
+                std::fs::read_to_string(directory.path().join("helper.log")).unwrap()
+            );
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -474,6 +490,7 @@ fn windows_killed_parent_stops_the_shell_and_keeps_recovery_blocked_until_it_sto
         );
         std::thread::sleep(Duration::from_millis(10));
     }
-    std::thread::sleep(Duration::from_secs(3));
+    std::fs::write(directory.path().join("release"), "").unwrap();
+    std::thread::sleep(Duration::from_secs(1));
     assert!(!directory.path().join("shell.finished").exists());
 }

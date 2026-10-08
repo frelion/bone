@@ -542,7 +542,7 @@ async fn acquire_credential_lock(path: &Path) -> Result<CredentialLock> {
     loop {
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(CredentialLock(vec![file])),
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(error) if crate::filesystem::lock_contended(&error) => {
                 // This future owns the unopened lease candidate. Cancellation
                 // closes it immediately; no blocking worker survives the call.
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;

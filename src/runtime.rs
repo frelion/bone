@@ -1232,7 +1232,7 @@ impl Engine {
                         Err(error)
                             if error
                                 .downcast_ref::<std::io::Error>()
-                                .is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock) => {}
+                                .is_some_and(crate::filesystem::lock_contended) => {}
                         Err(error) => return Err(error),
                     }
                 }
@@ -2705,7 +2705,7 @@ impl WriteLease {
             Err(error)
                 if error
                     .downcast_ref::<std::io::Error>()
-                    .is_some_and(|e| e.kind() == std::io::ErrorKind::WouldBlock) =>
+                    .is_some_and(crate::filesystem::lock_contended) =>
             {
                 return Ok(None);
             }

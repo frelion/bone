@@ -22,7 +22,7 @@ bone tools --read-only --single-job --json
 
 macOS、Windows 和 Linux 的预编译包见 [GitHub Releases](https://github.com/frelion/bone/releases/latest)，下载对应架构后解压，安装步骤在包内 `INSTALL.txt`。发布范围见 [0.9.4 发布说明](docs/releases/0.9.4.md)。
 
-需要 Rust 1.96 或更新版本；本地协议验收还需要 Python 3。
+预编译版运行不需要 Rust、Python 或编译器。以下源码构建需要 Rust 1.96 或更新版本；本地协议验收还需要 Python 3。
 
 ```sh
 cargo build --locked

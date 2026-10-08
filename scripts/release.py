@@ -73,6 +73,20 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def windows_imports(binary):
+    tool = shutil.which("llvm-readobj")
+    if not tool:
+        installed = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "LLVM/bin/llvm-readobj.exe"
+        require(installed.is_file(), "Native Windows runner is missing llvm-readobj for the PE dependency gate")
+        tool = str(installed)
+    imports = sorted(set(re.findall(r"Name:\s+(\S+\.dll)", command(tool, "--coff-imports", str(binary)), re.I)))
+    require(imports, "Could not inspect PE imports")
+    redistributable = [dll for dll in imports if re.match(r"(?:vcruntime|msvcp|msvcr\d|concrt|mfc\d|vcomp)", dll, re.I)]
+    require(not redistributable, f"Windows release depends on VC redistributable DLLs: {redistributable}")
+    print(f"PASS: PE dependency check: {', '.join(imports)}")
+    return imports
+
+
 def installation(target):
     if "windows" in target:
         return """BONE for Windows 11 / Windows Server 2025 or newer.
@@ -101,6 +115,7 @@ def package(args):
     name = f"bone-{args.tag}-{args.target}"
     binary_name = "bone.exe" if "windows" in args.target else "bone"
     binary = Path("target") / args.target / "release" / binary_name
+    imports = windows_imports(binary) if "windows" in args.target else None
     if "linux-musl" in args.target:
         require("INTERP" not in command("readelf", "--program-headers", str(binary)), "Linux release must be static")
     smoke(binary, package_version)
@@ -137,6 +152,8 @@ def package(args):
         "archive": archive.name,
         "sha256": digest(archive),
         "rustc": rustc,
+        "rustflags": os.environ.get("RUSTFLAGS", ""),
+        "windows_imports": imports,
         "features": "default",
         "test_command": f"cargo test --locked --target {args.target}",
         "smoke": ["version", "help", "tools", "providers", "config", "empty sessions"],
@@ -156,6 +173,9 @@ def aggregate(args):
         require(build['archive'] == f"bone-{args.tag}-{build['target']}{suffix}", "Unexpected archive name")
         require(build['commit'] == args.commit and build['version'] == package_version, "Build identity mismatch")
         require(build['extracted_smoke_passed'] and build['features'] == "default", "Extracted smoke failed")
+        if "windows" in build['target']:
+            require(build['windows_imports'], "Missing native PE dependency evidence")
+            require("+crt-static" in build['rustflags'], "Windows build did not enable a static CRT")
         require(build['sha256'] == digest(dist / build['archive']), "Archive checksum mismatch")
     (dist / "release-builds.json").write_text(json.dumps(builds, indent=2) + "\n")
     for path in dist.glob("build-*.json"):

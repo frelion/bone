@@ -1,6 +1,15 @@
 //! Concrete file commits shared by the runtime and local UI.
 use std::{fs::File, io, path::Path};
 
+/// fs2 reports ERROR_LOCK_VIOLATION on Windows, which Rust does not classify as
+/// WouldBlock. Keep nonblocking ownership checks native on every platform.
+pub(crate) fn lock_contended(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::WouldBlock
+        || error
+            .raw_os_error()
+            .is_some_and(|code| Some(code) == fs2::lock_contended_error().raw_os_error())
+}
+
 pub fn replace(source: &Path, destination: &Path) -> io::Result<()> {
     #[cfg(windows)]
     return windows_move(source, destination, true);
