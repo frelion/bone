@@ -169,33 +169,36 @@ async fn stop_collects_tool_result_before_releasing_ownership_and_allows_new_wor
     engine.prepare_pending_input().unwrap();
     let job = engine.state.focus.clone().unwrap();
     let command = if cfg!(windows) {
-        "powershell.exe -NoProfile -NonInteractive -Command \"[Console]::Write('before stop'); [Console]::Out.Flush(); [IO.File]::WriteAllText('ready.txt', 'ready'); while ($true) { [Threading.Thread]::Sleep(10) }\""
+        // Test the native cmd.exe process ownership, without a second shell's
+        // PowerShell/.NET cold start competing with the whole parallel suite.
+        std::fs::write(
+            engine.state.workspace.join("stop-fixture.py"),
+            r#"
+from pathlib import Path
+import sys, time
+sys.stdout.reconfigure(encoding='utf-8')
+sys.stdout.write('before stop')
+sys.stdout.flush()
+Path('ready.txt').write_text('ready', encoding='utf-8')
+while True:
+    time.sleep(0.01)
+"#,
+        )
+        .unwrap();
+        "python -B stop-fixture.py"
     } else {
         "printf 'before stop'; printf 'ready' > ready.txt; while :; do sleep 0.01; done"
     };
     engine.drain_tool_progress();
-    let tool = native_proposal(&mut engine, &job, "shell", json!({"command":command}));
+    let tool = native_proposal(
+        &mut engine,
+        &job,
+        "shell",
+        json!({"command":command,"timeout_seconds":120}),
+    );
     engine.start_tool(&job, tool).unwrap();
     let call = engine.state.jobs[&job].current_call.clone().unwrap();
-    let ready = engine.state.workspace.join("ready.txt");
-    // Live previews are lossy. A physical marker after stdout is flushed proves
-    // the command actually started, independently of observation timing.
-    tokio::time::timeout(Duration::from_secs(30), async {
-        while std::fs::read_to_string(&ready).ok().as_deref() != Some("ready") {
-            if engine.running[&call].abort.is_finished() {
-                while engine.running.contains_key(&call) {
-                    engine.step().await.unwrap();
-                }
-                panic!(
-                    "shell ended before readiness: {}",
-                    engine.read_call_event(&call, "tool_result").unwrap().data
-                );
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    wait_for_shell_ready(&mut engine, &call).await;
 
     engine.stop().unwrap();
     assert!(engine.state.paused);
@@ -225,7 +228,7 @@ async fn stop_collects_tool_result_before_releasing_ownership_and_allows_new_wor
     );
     engine.stop().unwrap();
     // Allow the bounded child wait, pipe drain and Windows job cleanup to finish.
-    tokio::time::timeout(Duration::from_secs(20), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         while !engine.is_quiescent() {
             engine.step().await.unwrap();
         }
@@ -265,6 +268,27 @@ async fn stop_collects_tool_result_before_releasing_ownership_and_allows_new_wor
         "new work"
     );
     assert!(engine.pending_tools(&job).unwrap().is_empty());
+}
+
+async fn wait_for_shell_ready(engine: &mut Engine, call: &str) {
+    let ready = engine.state.workspace.join("ready.txt");
+    // The child writes this only after flushing its startup output. Runtime
+    // previews are lossy and must not double as process-start evidence.
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while std::fs::read_to_string(&ready).ok().as_deref() != Some("ready") {
+            if engine.running[call].abort.is_finished() {
+                while engine.running.contains_key(call) {
+                    engine.step().await.unwrap();
+                }
+                panic!("shell ended before readiness: {}", engine.read_call_event(call, "tool_result").unwrap().data);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap_or_else(|error| {
+        let workspace = engine.state.workspace.display().to_string();
+        let progress = engine.drain_tool_progress();
+        panic!("shell startup did not reach its flushed-output marker in {workspace}: {error}; recent progress: {progress:?}");
+    });
 }
 
 #[test]
@@ -1524,17 +1548,41 @@ async fn readable_summary_pages_skip_native_metadata_and_preserve_every_characte
 
 #[tokio::test]
 async fn shell_progress_precedes_completion_and_keeps_final_output_after_new_input() {
-    let command = if cfg!(windows) {
-        "powershell.exe -NoProfile -NonInteractive -Command \"[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); [Console]::Write('early 中文'); [Console]::Error.Write('warning;native='+[Environment]::CurrentDirectory); while (![IO.File]::Exists('release')) { [Threading.Thread]::Sleep(10) }; [Console]::Write(' final')\""
-    } else {
-        "printf 'early 中文'; printf 'warning' >&2; while [ ! -f release ]; do sleep 0.01; done; printf ' final'"
-    };
     let (_directory, mut engine) = fixture_engine();
+    let command = if cfg!(windows) {
+        std::fs::write(
+            engine.state.workspace.join("progress-fixture.py"),
+            r#"
+from pathlib import Path
+import os, sys, time
+sys.stdout.reconfigure(encoding='utf-8')
+sys.stderr.reconfigure(encoding='utf-8')
+sys.stdout.write('early 中文')
+sys.stdout.flush()
+sys.stderr.write('warning;native=' + os.getcwd())
+sys.stderr.flush()
+Path('ready.txt').write_text('ready', encoding='utf-8')
+while not Path('release').exists():
+    time.sleep(0.01)
+sys.stdout.write(' final')
+sys.stdout.flush()
+"#,
+        )
+        .unwrap();
+        "python -B progress-fixture.py"
+    } else {
+        "printf 'early 中文'; printf 'warning' >&2; printf 'ready' > ready.txt; while [ ! -f release ]; do sleep 0.01; done; printf ' final'"
+    };
     engine.post("run a build", None).unwrap();
     engine.prepare_pending_input().unwrap();
     let job = engine.state.focus.clone().unwrap();
     assert!(engine.drain_tool_progress().is_empty());
-    let tool = native_proposal(&mut engine, &job, "shell", json!({"command":command}));
+    let tool = native_proposal(
+        &mut engine,
+        &job,
+        "shell",
+        json!({"command":command,"timeout_seconds":120}),
+    );
     engine.start_tool(&job, tool).unwrap();
     let call = engine.state.jobs[&job].current_call.clone().unwrap();
     assert!(
@@ -1544,7 +1592,8 @@ async fn shell_progress_precedes_completion_and_keeps_final_output_after_new_inp
             .iter()
             .any(|event| event.kind == "tool_started" && event.call_id.as_ref() == Some(&call))
     );
-    let observed = tokio::time::timeout(Duration::from_secs(if cfg!(windows) { 20 } else { 3 }), async {
+    wait_for_shell_ready(&mut engine, &call).await;
+    let observed = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             let records = engine.drain_tool_progress();
             if let Some(record) = records
@@ -1553,6 +1602,7 @@ async fn shell_progress_precedes_completion_and_keeps_final_output_after_new_inp
             {
                 break record;
             }
+            assert!(!engine.running[&call].abort.is_finished(), "shell completed before its live progress was observed");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -1580,7 +1630,7 @@ async fn shell_progress_precedes_completion_and_keeps_final_output_after_new_inp
         "old revision leaked after new input"
     );
     std::fs::write(engine.state.workspace.join("release"), "").unwrap();
-    let done = tokio::time::timeout(Duration::from_secs(3), engine.tasks.join_next())
+    let done = tokio::time::timeout(Duration::from_secs(30), engine.tasks.join_next())
         .await
         .unwrap_or_else(|error| {
             panic!(
