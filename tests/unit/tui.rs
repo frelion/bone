@@ -924,7 +924,7 @@ async fn an_old_delivery_cannot_hide_a_new_real_model_call_or_restart_its_clock(
 #[tokio::test]
 async fn a_quiet_real_shell_animates_and_waiting_for_a_reply_does_not() {
     let command = if cfg!(windows) {
-        "powershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Milliseconds 600\""
+        "powershell.exe -NoProfile -NonInteractive -Command \"[Threading.Thread]::Sleep(600)\""
     } else {
         "sleep 0.6"
     };

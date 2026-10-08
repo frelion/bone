@@ -344,7 +344,7 @@ async fn observed_shell_drains_beyond_preview_and_keeps_timeout_uncertainty() {
     assert!(!outcome.uncertain);
     bytes.store(0, Ordering::Relaxed);
     let command = if cfg!(windows) {
-        "powershell.exe -NoProfile -NonInteractive -Command \"[Console]::Out.Write('observed-before-timeout'); Start-Sleep -Seconds 5\""
+        "powershell.exe -NoProfile -NonInteractive -Command \"[Console]::Out.Write('observed-before-timeout'); [Threading.Thread]::Sleep(5000)\""
     } else {
         "printf observed-before-timeout; sleep 5"
     };

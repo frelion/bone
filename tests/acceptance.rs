@@ -325,7 +325,7 @@ async fn new_instruction_blocks_unstarted_write_proposals() {
 #[tokio::test]
 async fn interrupted_write_survives_restart_and_requires_reconciliation() {
     let command = if cfg!(windows) {
-        "powershell.exe -NoProfile -NonInteractive -Command \"[IO.File]::AppendAllText('effect.txt', 'x'); Start-Sleep -Seconds 5\""
+        "powershell.exe -NoProfile -NonInteractive -Command \"[IO.File]::AppendAllText('effect.txt', 'x'); [Threading.Thread]::Sleep(5000)\""
     } else {
         "printf x >> effect.txt; sleep 5"
     };

@@ -345,7 +345,7 @@ fn chat_deadline_pauses_a_model_call_and_preserves_resumable_input() {
 #[test]
 fn chat_deadline_retains_unknown_write_and_does_not_repeat_it_on_reopen() {
     let command = if cfg!(windows) {
-        "powershell.exe -NoProfile -NonInteractive -Command \"[IO.File]::WriteAllText('started.txt', 'started'); Start-Sleep -Seconds 5; [IO.File]::WriteAllText('finished.txt', 'finished')\""
+        "powershell.exe -NoProfile -NonInteractive -Command \"[IO.File]::WriteAllText('started.txt', 'started'); [Threading.Thread]::Sleep(5000); [IO.File]::WriteAllText('finished.txt', 'finished')\""
     } else {
         "printf started > started.txt; sleep 5; printf finished > finished.txt"
     };
