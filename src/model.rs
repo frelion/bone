@@ -559,13 +559,13 @@ fn authentication_error(profile_name: &str, error: AuthError) -> anyhow::Error {
     };
     // Do not attach a source chain: OAuth responses/cache parsing may contain
     // credentials. The SDK alone interprets the credential record.
-    anyhow::anyhow!("{reason}; run `bone login --profile {profile_name}` to sign in again")
+    anyhow::anyhow!("{reason}; run `bone login --profile '{profile_name}'` to sign in again")
 }
 
 pub fn call_error(profile_name: &str, error: ProviderError) -> anyhow::Error {
     if error.report().http_status == Some(401) {
         anyhow::anyhow!(
-            "provider rejected authentication (401); run `bone login --profile {profile_name}` for subscription profiles or update the configured credential"
+            "provider rejected authentication (401); run `bone login --profile '{profile_name}'` for subscription profiles or update the configured credential"
         )
     } else {
         error.into()

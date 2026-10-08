@@ -1,0 +1,257 @@
+[
+  {
+    "scenario": "product-flow",
+    "status": "PASS",
+    "binary": "/private/tmp/bone-product-candidate",
+    "binary_sha256_at_start": "4e4924c36faca204071db481670736a32e19fc0ae7ef68d1f63d9f432ad2d864",
+    "source_fingerprint_at_start": "bf41c9a527c728ac1ace1132bfd58021218e550e463faa85269911f177c624d1",
+    "source_fingerprint_at_end": "bf41c9a527c728ac1ace1132bfd58021218e550e463faa85269911f177c624d1",
+    "harness_sha256_at_start": "bc47f3f7a159a210e4bb578a3235085c4cf9ceeefec334697584ecc32ba474e3",
+    "harness_sha256_at_end": "bc47f3f7a159a210e4bb578a3235085c4cf9ceeefec334697584ecc32ba474e3",
+    "checks": [
+      {
+        "name": "mixed titles expose distinct required attention words",
+        "passed": true,
+        "observed": null
+      },
+      {
+        "name": "current identity and browsed candidate remain different without color",
+        "passed": true,
+        "observed": {
+          "current_row": 2,
+          "candidate_row": 3,
+          "highlighted_rows": [
+            3
+          ]
+        }
+      },
+      {
+        "name": "authored sidebar list remains a session list",
+        "passed": true,
+        "observed": null
+      },
+      {
+        "name": "session switch keeps answer target, caret and selection",
+        "passed": true,
+        "observed": null
+      },
+      {
+        "name": "all existing target drafts survive session switch and process restart",
+        "passed": true,
+        "observed": null
+      },
+      {
+        "name": "Tab completes a slash candidate without execution",
+        "passed": true,
+        "observed": null
+      },
+      {
+        "name": "slash Enter opens its selected action in one step",
+        "passed": true,
+        "observed": null
+      },
+      {
+        "name": "click input edits only the draft",
+        "passed": true,
+        "observed": null
+      },
+      {
+        "name": "action failure remains until correction, rather than expiring",
+        "passed": true,
+        "observed": null
+      },
+      {
+        "name": "final API step allows checking the actual connection before saving",
+        "passed": true,
+        "observed": null
+      },
+      {
+        "name": "API key does not enter terminal text or conversation",
+        "passed": true,
+        "observed": null
+      },
+      {
+        "name": "separate history work leaves original question and its answer draft paused",
+        "passed": true,
+        "observed": null
+      },
+      {
+        "name": "reading at the top loads older persisted conversation",
+        "passed": true,
+        "observed": null
+      },
+      {
+        "name": "navigation and historical loading make no new model requests",
+        "passed": true,
+        "observed": {
+          "requests": 13,
+          "events": 62
+        }
+      }
+    ],
+    "frames": 16,
+    "requests": 13
+  },
+  {
+    "scenario": "workspace-flow",
+    "status": "PASS",
+    "binary": "/private/tmp/bone-product-candidate",
+    "binary_sha256_at_start": "4e4924c36faca204071db481670736a32e19fc0ae7ef68d1f63d9f432ad2d864",
+    "source_fingerprint_at_start": "bf41c9a527c728ac1ace1132bfd58021218e550e463faa85269911f177c624d1",
+    "source_fingerprint_at_end": "bf41c9a527c728ac1ace1132bfd58021218e550e463faa85269911f177c624d1",
+    "harness_sha256_at_start": "035902eef1c84d563a07c464ae30a384dfc6b8d0ecf1a6f9f5fe3b08a972e183",
+    "harness_sha256_at_end": "035902eef1c84d563a07c464ae30a384dfc6b8d0ecf1a6f9f5fe3b08a972e183",
+    "checks": [
+      {
+        "name": "session list is not a job list",
+        "passed": true,
+        "observed": {
+          "sessions": 1,
+          "jobs": 2
+        }
+      },
+      {
+        "name": "async session result leaves editable draft intact",
+        "passed": true,
+        "observed": null
+      },
+      {
+        "name": "sidebar focus hides editor cursor",
+        "passed": true,
+        "observed": null
+      },
+      {
+        "name": "conversation focus hides editing caret",
+        "passed": true,
+        "observed": null
+      },
+      {
+        "name": "input focus has visible hardware caret",
+        "passed": true,
+        "observed": null
+      },
+      {
+        "name": "session change saves and pauses the source",
+        "passed": true,
+        "observed": null
+      },
+      {
+        "name": "new session and focus actions do not call models",
+        "passed": true,
+        "observed": null
+      },
+      {
+        "name": "actual api_a request uses fixture",
+        "passed": true,
+        "observed": {
+          "route": "api_a",
+          "models": [
+            "fixture"
+          ]
+        }
+      },
+      {
+        "name": "reopened session retains its exact target and readable question",
+        "passed": true,
+        "observed": null
+      },
+      {
+        "name": "invalid local endpoint preserves usable config",
+        "passed": true,
+        "observed": null
+      },
+      {
+        "name": "secret is masked and never becomes main draft",
+        "passed": true,
+        "observed": null
+      },
+      {
+        "name": "secret-step cancel preserves prior connection",
+        "passed": true,
+        "observed": null
+      },
+      {
+        "name": "connection save makes no hidden model request",
+        "passed": true,
+        "observed": null
+      },
+      {
+        "name": "parent editor draft survives successful connection form",
+        "passed": true,
+        "observed": null
+      },
+      {
+        "name": "actual api_b request uses arbitrary-org/model:v2",
+        "passed": true,
+        "observed": {
+          "route": "api_b",
+          "models": [
+            "arbitrary-org/model:v2"
+          ]
+        }
+      },
+      {
+        "name": "model form preserves API B endpoint",
+        "passed": true,
+        "observed": null
+      },
+      {
+        "name": "actual api_b request uses native/any:opaque-model-v9",
+        "passed": true,
+        "observed": {
+          "route": "api_b",
+          "models": [
+            "native/any:opaque-model-v9"
+          ]
+        }
+      },
+      {
+        "name": "actual api_b request uses native/any:opaque-model-v9",
+        "passed": true,
+        "observed": {
+          "route": "api_b",
+          "models": [
+            "native/any:opaque-model-v9"
+          ]
+        }
+      },
+      {
+        "name": "actual api_b request uses arbitrary-subscription-fixture-model",
+        "passed": true,
+        "observed": {
+          "route": "api_b",
+          "models": [
+            "arbitrary-subscription-fixture-model"
+          ]
+        }
+      },
+      {
+        "name": "narrow session popover returns to editing focus",
+        "passed": true,
+        "observed": null
+      },
+      {
+        "name": "narrow session popover preserves configured model and draft",
+        "passed": true,
+        "observed": null
+      },
+      {
+        "name": "invisible narrow model field cannot submit",
+        "passed": true,
+        "observed": null
+      },
+      {
+        "name": "narrow model modal cancel preserves configured model and draft",
+        "passed": true,
+        "observed": null
+      },
+      {
+        "name": "secrets never reach VT output, input history or durable events",
+        "passed": true,
+        "observed": null
+      }
+    ],
+    "frames": 18,
+    "requests": 8
+  }
+]

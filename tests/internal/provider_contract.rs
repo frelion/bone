@@ -129,7 +129,7 @@ async fn unauthorized_native_call_exits_once_with_explicit_relogin_instruction()
         .unwrap_err();
     assert_eq!(error.report().http_status, Some(401));
     let error = model::call_error("fixture", error).to_string();
-    assert!(error.contains("bone login --profile fixture"));
+    assert!(error.contains("bone login --profile 'fixture'"));
     let requests =
         std::fs::read_to_string(fixture.directory.path().join("requests.jsonl")).unwrap();
     assert_eq!(requests.lines().count(), 1);

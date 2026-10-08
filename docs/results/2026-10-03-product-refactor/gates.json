@@ -1,0 +1,127 @@
+{
+  "status": "PASS",
+  "complete": true,
+  "results": [
+    {
+      "name": "format",
+      "command": [
+        "cargo",
+        "fmt",
+        "--check"
+      ],
+      "exit_code": 0,
+      "seconds": 0.18
+    },
+    {
+      "name": "rust-tests",
+      "command": [
+        "cargo",
+        "test",
+        "--locked",
+        "--quiet"
+      ],
+      "exit_code": 0,
+      "seconds": 14.37,
+      "passed_tests": 254
+    },
+    {
+      "name": "clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "--locked",
+        "--all-targets",
+        "--all-features",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "seconds": 1.79
+    },
+    {
+      "name": "python-tests",
+      "command": [
+        "python3",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "tests",
+        "-p",
+        "test_*.py"
+      ],
+      "exit_code": 0,
+      "seconds": 0.12
+    },
+    {
+      "name": "install",
+      "command": [
+        "cargo",
+        "install",
+        "--path",
+        ".",
+        "--locked",
+        "--force"
+      ],
+      "exit_code": 0,
+      "seconds": 8.56
+    }
+  ],
+  "verified_date": "2026-10-08",
+  "source_fingerprint": "4c1f5d81ba32b9ddd53e791cf67c0d5907be93e335311005a3743a2a1aa73dd9",
+  "binary_sha256": "4a10173576f6d81e374cc092e7b5c9ee65ec15e569af168ebbacb7c82e859662",
+  "harness_sha256": "a672be290b41a3f0fe1a65bfec364abf51294401e8779c94242e844566e58a7d",
+  "version": "bone 0.9.0",
+  "pty_final": [
+    {
+      "path": "pty/80x24/product-flow/product-flow.json",
+      "size": "80x24",
+      "case": "product-flow",
+      "checks": 16,
+      "frames": 16,
+      "status": "PASS"
+    },
+    {
+      "path": "pty/80x24/workspace-flow/workspace-flow.json",
+      "size": "80x24",
+      "case": "workspace-flow",
+      "checks": 24,
+      "frames": 18,
+      "status": "PASS"
+    },
+    {
+      "path": "pty/120x40/product-flow/product-flow.json",
+      "size": "120x40",
+      "case": "product-flow",
+      "checks": 16,
+      "frames": 16,
+      "status": "PASS"
+    },
+    {
+      "path": "pty/120x40/workspace-flow/workspace-flow.json",
+      "size": "120x40",
+      "case": "workspace-flow",
+      "checks": 24,
+      "frames": 18,
+      "status": "PASS"
+    },
+    {
+      "path": "pty/color80x24/product-flow/product-flow.json",
+      "size": "color80x24",
+      "case": "product-flow",
+      "checks": 16,
+      "frames": 16,
+      "status": "PASS"
+    },
+    {
+      "path": "pty/color80x24/workspace-flow/workspace-flow.json",
+      "size": "color80x24",
+      "case": "workspace-flow",
+      "checks": 24,
+      "frames": 18,
+      "status": "PASS"
+    }
+  ]
+}

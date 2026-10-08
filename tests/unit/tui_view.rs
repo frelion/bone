@@ -52,13 +52,13 @@ fn stream_updates_retain_full_text_and_bounded_prompt_history() {
     let mut view = View::new();
     let text = "e\u{301}".repeat(20_000);
     view.upsert_message(Message {
-        role: "AI".into(),
+        kind: MessageKind::Delivery,
         text: "small".into(),
         event_id: Some("1".into()),
         summary: None,
     });
     view.upsert_message(Message {
-        role: "AI".into(),
+        kind: MessageKind::Delivery,
         text: text.clone(),
         event_id: Some("1".into()),
         summary: None,
@@ -138,7 +138,7 @@ fn selected_message_positions_once_and_stream_updates_preserve_scroll() {
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     for i in 0..20 {
         view.push_message(Message {
-            role: "AI".into(),
+            kind: MessageKind::Delivery,
             text: "body".into(),
             event_id: Some(i.to_string()),
             summary: None,
@@ -152,7 +152,10 @@ fn selected_message_positions_once_and_stream_updates_preserve_scroll() {
     view.conversation_scroll += 3;
     let scroll = view.conversation_scroll;
     view.upsert_message(Message {
-        role: "工具输出中".into(),
+        kind: MessageKind::Tool {
+            name: "shell".into(),
+            state: ToolState::Running,
+        },
         text: "update".into(),
         event_id: Some("19".into()),
         summary: None,
@@ -210,7 +213,7 @@ fn prepend_retains_reading_anchor_and_selected_message() {
     let mut view = View::new();
     view.cache_width = 8;
     view.push_message(Message {
-        role: "Agent".into(),
+        kind: MessageKind::Delivery,
         text: "current".into(),
         event_id: Some("current".into()),
         summary: None,
@@ -219,7 +222,7 @@ fn prepend_retains_reading_anchor_and_selected_message() {
     view.selection_needs_scroll = false;
     view.conversation_scroll = 1;
     let old = Message {
-        role: "Agent".into(),
+        kind: MessageKind::Delivery,
         text: "older\nbody".into(),
         event_id: Some("old".into()),
         summary: None,
@@ -230,7 +233,7 @@ fn prepend_retains_reading_anchor_and_selected_message() {
     assert_eq!(view.conversation_scroll, 1 + shift);
     assert!(!view.follow_conversation);
     view.prepend_messages(vec![Message {
-        role: "Agent".into(),
+        kind: MessageKind::Delivery,
         text: "duplicate".into(),
         event_id: Some("old".into()),
         summary: None,
@@ -267,7 +270,7 @@ fn long_agent_delivery_remains_readable_without_expanding() {
     let mut view = View::new();
     let text = format!("{}\n交付尾部", "中文原文\n".repeat(4000));
     view.push_message(Message {
-        role: "AI".into(),
+        kind: MessageKind::Delivery,
         text: text.clone(),
         event_id: Some("long".into()),
         summary: None,
@@ -317,7 +320,7 @@ fn renders_narrow_wide_and_modal_views_without_terminal_controls() {
         let mut view = View::new();
         view.paste("中文\n👩‍💻\n第三行");
         view.push_message(Message {
-            role: "用户".into(),
+            kind: MessageKind::User { admitted: false },
             text: "\x1b[31m任务\x07详情".into(),
             event_id: None,
             summary: None,
@@ -438,7 +441,10 @@ fn conversation_navigation_and_tool_logs_are_readable() {
     let mut view = View::new();
     for index in 0..3 {
         view.push_message(Message {
-            role: "工具 · shell 完成".into(),
+            kind: MessageKind::Tool {
+                name: "shell".into(),
+                state: ToolState::Completed,
+            },
             text: "# raw\n  indentation\n- literal".into(),
             event_id: Some(index.to_string()),
             summary: None,
@@ -525,7 +531,7 @@ fn bounded_window_evicts_opposite_edge_and_retains_draft() {
     view.paste("independent draft");
     for i in 0..256 {
         view.push_message(Message {
-            role: "AI".into(),
+            kind: MessageKind::Delivery,
             text: "body".into(),
             event_id: Some(i.to_string()),
             summary: None,
@@ -533,7 +539,7 @@ fn bounded_window_evicts_opposite_edge_and_retains_draft() {
     }
     view.select_message("0");
     view.push_message(Message {
-        role: "AI".into(),
+        kind: MessageKind::Delivery,
         text: "new".into(),
         event_id: Some("256".into()),
         summary: None,
@@ -544,7 +550,7 @@ fn bounded_window_evicts_opposite_edge_and_retains_draft() {
     assert_eq!(view.draft(), "independent draft");
     view.select_message("1");
     view.prepend_messages(vec![Message {
-        role: "AI".into(),
+        kind: MessageKind::Delivery,
         text: "older".into(),
         event_id: Some("old".into()),
         summary: None,
@@ -558,7 +564,10 @@ fn bounded_window_evicts_opposite_edge_and_retains_draft() {
     );
     for i in 0..80 {
         view.upsert_message(Message {
-            role: "工具完成".into(),
+            kind: MessageKind::Tool {
+                name: "shell".into(),
+                state: ToolState::Completed,
+            },
             text: "👩‍💻".repeat(30_000),
             event_id: Some(format!("big{i}")),
             summary: None,
@@ -567,7 +576,12 @@ fn bounded_window_evicts_opposite_edge_and_retains_draft() {
     assert!(
         view.messages
             .iter()
-            .map(|m| m.text.len() + m.role.len() + m.event_id.as_ref().map_or(0, String::len))
+            .map(|m| m.text.len()
+                + m.event_id.as_ref().map_or(0, String::len)
+                + match &m.kind {
+                    MessageKind::Tool { name, .. } => name.len(),
+                    _ => 0,
+                })
             .sum::<usize>()
             <= 8 * 1024 * 1024
     );
@@ -617,7 +631,7 @@ fn narrow_conversation_focus_selects_latest_and_tool_status_is_explicit() {
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     let mut view = View::new();
     view.push_message(Message {
-        role: "AI".into(),
+        kind: MessageKind::Delivery,
         text: "latest".into(),
         event_id: Some("latest".into()),
         summary: None,
@@ -628,15 +642,22 @@ fn narrow_conversation_focus_selects_latest_and_tool_status_is_explicit() {
     view.handle_key(key(KeyCode::F(6)));
     assert_eq!(view.focus, Focus::Conversation);
     assert_eq!(view.selected_message_id(), Some("latest"));
-    for (text, color) in [
-        ("执行中 · command", Color::Blue),
-        ("结果未知 · 需核查", Color::Yellow),
-        ("失败 · command", Color::Red),
-        ("完成 · command", Color::Green),
-        ("完成 · 未知错误文件.txt", Color::Green),
+    for (text, state, color) in [
+        ("执行中 · command", ToolState::Running, Color::Blue),
+        ("结果未知 · 需核查", ToolState::Unknown, Color::Yellow),
+        ("失败 · command", ToolState::Failed, Color::Red),
+        ("完成 · command", ToolState::Completed, Color::Green),
+        (
+            "完成 · 未知错误文件.txt",
+            ToolState::Completed,
+            Color::Green,
+        ),
     ] {
         let message = Message {
-            role: "工具 · shell".into(),
+            kind: MessageKind::Tool {
+                name: "shell".into(),
+                state,
+            },
             text: text.into(),
             event_id: None,
             summary: None,
@@ -716,7 +737,7 @@ fn temporary_reconciliation_draft_restores_reader_and_original_editor() {
 fn tab_keeps_focus_and_f6_switches_reading_and_input() {
     let mut view = View::new();
     view.push_message(Message {
-        role: "Agent".into(),
+        kind: MessageKind::Delivery,
         text: "delivery".into(),
         event_id: Some("e".into()),
         summary: None,
@@ -734,7 +755,10 @@ fn tab_keeps_focus_and_f6_switches_reading_and_input() {
 #[test]
 fn successful_tools_are_one_summary_and_failure_shows_reason_first() {
     let success = Message {
-        role: "工具 · shell".into(),
+        kind: MessageKind::Tool {
+            name: "shell".into(),
+            state: ToolState::Completed,
+        },
         text: "完成\nfull output\nextra output".into(),
         event_id: Some("s".into()),
         summary: Some("cargo check · exit 0".into()),
@@ -750,7 +774,10 @@ fn successful_tools_are_one_summary_and_failure_shows_reason_first() {
     assert!(!content.contains("full output"));
     assert!(message_lines(&success, 80, true, false).len() > compact.len());
     let failure = Message {
-        role: "工具 · shell".into(),
+        kind: MessageKind::Tool {
+            name: "shell".into(),
+            state: ToolState::Failed,
+        },
         text: "失败\nerror[E0425]: missing value\nstdout\nstderr".into(),
         event_id: Some("f".into()),
         summary: None,
@@ -774,7 +801,7 @@ fn new_output_preserves_source_location_on_resize_and_end_reaches_latest() {
         .map(|n| format!("paragraph {n:03}: {}\n", "source text ".repeat(12)))
         .collect::<String>();
     view.push_message(Message {
-        role: "Agent".into(),
+        kind: MessageKind::Delivery,
         text: text.clone(),
         event_id: Some("old".into()),
         summary: None,
@@ -787,13 +814,13 @@ fn new_output_preserves_source_location_on_resize_and_end_reaches_latest() {
     view.conversation_scroll = 60;
     let before = view.read_points[60].offset;
     view.push_message(Message {
-        role: "Agent".into(),
+        kind: MessageKind::Delivery,
         text: "new delivery".into(),
         event_id: Some("new".into()),
         summary: None,
     });
     view.upsert_message(Message {
-        role: "Agent".into(),
+        kind: MessageKind::Delivery,
         text: format!("{text}extra tail"),
         event_id: Some("old".into()),
         summary: None,
@@ -832,7 +859,10 @@ fn replacement_explains_when_live_observation_is_missing_from_final_result() {
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     let mut view = View::new();
     view.push_message(Message {
-        role: "工具 · shell 输出中".into(),
+        kind: MessageKind::Tool {
+            name: "shell".into(),
+            state: ToolState::Running,
+        },
         text: "observed data\n".repeat(40),
         event_id: Some("tool:call".into()),
         summary: None,
@@ -844,7 +874,10 @@ fn replacement_explains_when_live_observation_is_missing_from_final_result() {
         .unwrap();
     view.conversation_scroll = 8;
     view.upsert_message(Message {
-        role: "工具 · shell".into(),
+        kind: MessageKind::Tool {
+            name: "shell".into(),
+            state: ToolState::Completed,
+        },
         text: "完成\nfinal different output".into(),
         event_id: Some("tool:call".into()),
         summary: Some("exit 0".into()),
@@ -884,7 +917,7 @@ fn help_scrolls_and_returns_to_detail_at_same_offset() {
 
 #[test]
 fn running_tool_keeps_both_live_streams_observable_without_full_logs() {
-    let message = Message { role: "工具 · shell 输出中".into(), text: "执行中 · preview\nstdout:\nfirst\ncompiling module\nstderr:\nold warning\nwarning: latest\n".into(), event_id: Some("tool:c".into()), summary: None };
+    let message = Message { kind: MessageKind::Tool { name: "shell".into(), state: ToolState::Running }, text: "执行中 · preview\nstdout:\nfirst\ncompiling module\nstderr:\nold warning\nwarning: latest\n".into(), event_id: Some("tool:c".into()), summary: None };
     let rows = message_lines(&message, 80, false, false);
     let content = rows
         .iter()
@@ -982,7 +1015,7 @@ fn markdown_table_resize_stays_on_row_before_later_literal_border() {
     text.push_str("\n─ trailer\n");
     let mut view = View::new();
     view.push_message(Message {
-        role: "Agent".into(),
+        kind: MessageKind::Delivery,
         text,
         event_id: Some("table".into()),
         summary: None,
@@ -1026,7 +1059,10 @@ fn markdown_table_resize_stays_on_row_before_later_literal_border() {
 fn ten_successful_file_reads_occupy_ten_transcript_rows() {
     let messages = (0..10)
         .map(|index| Message {
-            role: "工具 · read_file".into(),
+            kind: MessageKind::Tool {
+                name: "read_file".into(),
+                state: ToolState::Completed,
+            },
             text: format!("完成\nfull file {index}\nmore body"),
             event_id: Some(format!("read:{index}")),
             summary: Some(format!("file{index}.rs · 返回 120 字节")),
@@ -1053,7 +1089,7 @@ fn overlay_borders_survive_terminal_diff_over_chinese_background() {
     for (width, height) in [(80, 24), (120, 40)] {
         let mut view = View::new();
         view.push_message(Message {
-            role: "Agent · 输出中（未交付）".into(),
+            kind: MessageKind::Streaming,
             text: "修复过期".repeat(200),
             event_id: Some("background".into()),
             summary: None,
@@ -1087,13 +1123,13 @@ fn overlay_borders_survive_terminal_diff_over_chinese_background() {
 #[test]
 fn transcript_keeps_original_paragraphs_without_person_role_headers() {
     let user = Message {
-        role: "你 · 已纳入 · ab123456".into(),
+        kind: MessageKind::User { admitted: true },
         text: "请解释原因".into(),
         event_id: Some("user".into()),
         summary: None,
     };
     let answer = Message {
-        role: "Agent".into(),
+        kind: MessageKind::Delivery,
         text: "这是具体原因。".into(),
         event_id: Some("answer".into()),
         summary: None,
@@ -1113,7 +1149,7 @@ fn transcript_keeps_original_paragraphs_without_person_role_headers() {
     assert!(visible.contains("请解释原因"));
     assert!(visible.contains("这是具体原因。"));
     let question = Message {
-        role: "Agent · 提问".into(),
+        kind: MessageKind::Question,
         text: "要使用哪个状态码？".into(),
         event_id: Some("q".into()),
         summary: None,
@@ -1318,11 +1354,9 @@ fn running_action_and_receipt_remain_separate_while_input_stays_editable() {
         .buffer()
         .content()
         .chunks(80)
-        .nth(action_row)
-        .unwrap()
-        .iter()
-        .map(|cell| cell.symbol())
-        .collect::<String>();
+        .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+        .find(|row| row.contains("cargo check"))
+        .unwrap();
     assert!(action.contains("cargo check"));
     assert!(action.contains("12s"));
 }
@@ -1416,7 +1450,7 @@ fn narrow_session_sidebar_is_explicit_and_returns_to_original_reader() {
         value: "selected".into(),
     }]);
     view.push_message(Message {
-        role: "Agent".into(),
+        kind: MessageKind::Delivery,
         text: "完整原文\n\n".repeat(100),
         event_id: Some("reader".into()),
         summary: None,
@@ -1596,12 +1630,12 @@ fn session_rows_distinguish_current_browse_selection_and_keep_refresh_errors_vis
     view.set_sessions(vec![
         PickerItem {
             label: format!("{prefix} A"),
-            detail: "运行中 · 刚刚".into(),
+            detail: "运行".into(),
             value: "a".into(),
         },
         PickerItem {
             label: format!("{prefix} B"),
-            detail: "待回答 · 今天".into(),
+            detail: "回复".into(),
             value: "b".into(),
         },
     ]);
@@ -1623,18 +1657,23 @@ fn session_rows_distinguish_current_browse_selection_and_keep_refresh_errors_vis
             .collect::<String>()
     };
     assert!(row_text(1).replace(' ', "").contains("读取失败"));
-    assert!(row_text(2).trim_end().ends_with("B"));
-    assert!(row_text(4).trim_end().ends_with("A"));
-    assert!(row_text(5).replace(' ', "").contains("当前"));
-    assert!(row_text(3).replace(' ', "").contains("待回答"));
+    assert!(row_text(2).contains("B"));
+    assert!(row_text(3).contains("A"));
+    assert!(row_text(3).replace(' ', "").contains("运行"));
+    assert!(row_text(2).replace(' ', "").contains("回复"));
     assert_eq!(buffer[(0, 0)].symbol(), " ");
     assert_eq!(buffer[(0, 2)].symbol(), "›");
-    for row in [2, 3] {
-        assert!(buffer[(0, row)].modifier.contains(Modifier::REVERSED));
-        assert!(buffer[(24, row)].modifier.contains(Modifier::REVERSED));
-    }
-    assert!(!buffer[(0, 4)].modifier.contains(Modifier::REVERSED));
-    assert!(buffer[(2, 4)].modifier.contains(Modifier::BOLD));
+    assert!(buffer[(0, 2)].modifier.contains(Modifier::REVERSED));
+    // Wide glyph continuation cells are empty in TestBackend; assert the visible
+    // glyphs themselves, including the rightmost attention word.
+    assert!(
+        (0..view.sidebar_width - 1)
+            .filter(|&x| buffer[(x, 2)].symbol() != " ")
+            .all(|x| buffer[(x, 2)].modifier.contains(Modifier::REVERSED))
+    );
+    assert!(!buffer[(0, 3)].modifier.contains(Modifier::REVERSED));
+    assert_eq!(buffer[(1, 3)].symbol(), "•");
+    assert!(buffer[(3, 3)].modifier.contains(Modifier::BOLD));
     for width in 0..35 {
         let fitted = middle_fit_line(&format!("{prefix} 👩‍💻 A"), width);
         assert!(UnicodeWidthStr::width(fitted.as_str()) <= width);
@@ -1645,7 +1684,7 @@ fn session_rows_distinguish_current_browse_selection_and_keep_refresh_errors_vis
 }
 
 #[test]
-fn session_mouse_maps_two_line_viewport_and_ignores_hidden_or_modal_rows() {
+fn session_mouse_maps_single_line_viewport_and_ignores_hidden_or_modal_rows() {
     use crossterm::event::MouseButton;
     use ratatui::{Terminal, backend::TestBackend};
     let state = bone::state::SessionState::new("/tmp/work");
@@ -1654,7 +1693,7 @@ fn session_mouse_maps_two_line_viewport_and_ignores_hidden_or_modal_rows() {
         (0..30)
             .map(|index| PickerItem {
                 label: format!("会话{index}"),
-                detail: "今天".into(),
+                detail: String::new(),
                 value: index.to_string(),
             })
             .collect(),
@@ -1665,7 +1704,7 @@ fn session_mouse_maps_two_line_viewport_and_ignores_hidden_or_modal_rows() {
         .unwrap();
     view.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
     view.handle_key(key(KeyCode::PageDown));
-    assert_eq!(view.selected_session(), Some("10"));
+    assert_eq!(view.selected_session(), Some("21"));
     terminal
         .draw(|frame| view.render(frame, &state, "m", "idle"))
         .unwrap();
@@ -1677,12 +1716,12 @@ fn session_mouse_maps_two_line_viewport_and_ignores_hidden_or_modal_rows() {
         modifiers: KeyModifiers::NONE,
     };
     assert_eq!(view.clicked_session(click(2)), Some("1".into()));
-    assert_eq!(view.clicked_session(click(5)), Some("2".into()));
+    assert_eq!(view.clicked_session(click(5)), Some("4".into()));
     assert_eq!(view.clicked_session(click(0)), None);
-    assert_eq!(view.clicked_session(click(22)), None);
+    assert_eq!(view.clicked_session(click(23)), None);
     view.open_help();
     assert_eq!(view.clicked_session(click(2)), None);
-    assert_eq!(view.selected_session(), Some("2"));
+    assert_eq!(view.selected_session(), Some("4"));
     view.handle_key(key(KeyCode::Esc));
     view.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
     terminal.backend_mut().resize(79, 24);
@@ -1701,6 +1740,148 @@ fn session_mouse_maps_two_line_viewport_and_ignores_hidden_or_modal_rows() {
         .draw(|frame| view.render(frame, &state, "m", "idle"))
         .unwrap();
     assert_eq!(view.clicked_session(click(2)), None);
+}
+
+#[test]
+fn long_model_keeps_project_context_and_empty_state_teaches_only_in_the_composer() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let state = bone::state::SessionState::new("/tmp/software-project");
+    for width in [80, 120] {
+        let mut view = View::new();
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                view.render(
+                    frame,
+                    &state,
+                    "团队订阅 · native/organization/very-long-configured-model-gpt-6-luna",
+                    "等待输入",
+                )
+            })
+            .unwrap();
+        let rows = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(usize::from(width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>();
+        assert!(rows[0].contains("software-project"));
+        assert!(rows[1].replace(' ', "").contains("团队订阅"));
+        assert!(rows[1].contains("6-luna"));
+        let screen = rows.join("\n").replace(' ', "");
+        assert_eq!(screen.matches("写下要完成的事").count(), 1);
+        assert!(!screen.contains("在下方"));
+        assert!(!screen.contains("输入中"));
+        assert_ne!(view.composer_area, Rect::default());
+        assert_ne!(view.conversation_area, Rect::default());
+        view.focus = Focus::Sessions;
+        terminal.backend_mut().resize(42, 24);
+        terminal
+            .draw(|frame| view.render(frame, &state, "m", "等待输入"))
+            .unwrap();
+        assert_eq!(view.composer_area, Rect::default());
+        assert_eq!(view.conversation_area, Rect::default());
+    }
+}
+
+#[test]
+fn connection_save_reviews_public_values_with_one_action_hint_and_blocks_parent_hit_areas() {
+    use ratatui::{Terminal, backend::TestBackend};
+    let state = bone::state::SessionState::new("/tmp/work");
+    for (width, height) in [(80, 24), (120, 40)] {
+        let mut view = View::new();
+        view.paste("保留我的草稿");
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| view.render(frame, &state, "m", "等待输入"))
+            .unwrap();
+        view.feedback_detail = "会话已打开 · 旧回执".into();
+        view.open_form(
+            "添加连接",
+            vec![
+                FormField {
+                    label: "连接名称".into(),
+                    value: "团队 API".into(),
+                    secret: false,
+                },
+                FormField {
+                    label: "模型名称".into(),
+                    value: "gpt-6-luna".into(),
+                    secret: false,
+                },
+                FormField {
+                    label: "API endpoint".into(),
+                    value: "http://localhost:9312/v1".into(),
+                    secret: false,
+                },
+                FormField {
+                    label: "API key".into(),
+                    value: "secret-never-render-this".into(),
+                    secret: true,
+                },
+            ],
+        );
+        for _ in 0..3 {
+            view.handle_key(key(KeyCode::Tab));
+        }
+        terminal
+            .draw(|frame| view.render(frame, &state, "m", "已暂停"))
+            .unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>()
+            .replace(' ', "");
+        let rows = terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(usize::from(width))
+            .map(|row| {
+                row.iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+                    .replace(' ', "")
+            })
+            .collect::<Vec<_>>();
+        let title_row = rows
+            .iter()
+            .position(|row| row.contains("添加连接"))
+            .unwrap();
+        let action_row = rows
+            .iter()
+            .position(|row| row.contains("Enter保存"))
+            .unwrap();
+        assert!(screen.contains("团队API"));
+        assert!(screen.contains("gpt-6-luna"));
+        assert!(screen.contains("http://localhost:9312/v1"));
+        assert!(!screen.contains("secret-never-render-this"));
+        assert!(!screen.contains("旧回执"));
+        assert_eq!(screen.matches("Enter保存").count(), 1);
+        assert!(
+            action_row - title_row <= 8,
+            "form should fit its content instead of filling the viewport"
+        );
+        assert_eq!(view.composer_area, Rect::default());
+        assert_eq!(view.conversation_area, Rect::default());
+        let draft_row = rows
+            .iter()
+            .position(|row| row.contains("保留我的草稿"))
+            .unwrap();
+        assert!(
+            terminal.backend().buffer().content()
+                [draft_row * usize::from(width)..(draft_row + 1) * usize::from(width)]
+                .iter()
+                .all(|cell| !cell.modifier.contains(Modifier::REVERSED)),
+            "nonactive parent draft must not render a caret"
+        );
+        view.handle_key(key(KeyCode::Esc));
+        assert_eq!(view.draft(), "保留我的草稿");
+    }
 }
 
 #[test]

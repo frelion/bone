@@ -52,6 +52,173 @@ fn unsafe_profile_names_and_empty_companion_models_are_rejected() {
 }
 
 #[test]
+fn human_connection_names_allow_languages_and_spaces_without_accepting_path_or_toml_syntax() {
+    for name in [
+        "团队开发 API",
+        "Café API",
+        "機械学習_GPU2",
+        "فريق٢",
+        "dev-team_v2",
+    ] {
+        validate_profile_name(name).unwrap();
+    }
+    validate_profile_name(&"a".repeat(80)).unwrap();
+    validate_profile_name(&"团".repeat(26)).unwrap();
+    assert!(validate_profile_name(&"a".repeat(81)).is_err());
+    assert!(validate_profile_name(&"团".repeat(27)).is_err());
+    for name in [
+        "",
+        " ",
+        " leading",
+        "trailing ",
+        ".",
+        "..",
+        "团队/开发",
+        "团队\\开发",
+        "团队.开发",
+        "团队\0开发",
+        "团队\n开发",
+        "团队\t开发",
+        "团队\r开发",
+        "[团队]",
+        "团队=开发",
+        "团队\"开发",
+        "团队'开发",
+        "团队#开发",
+        "团队:开发",
+        "团队$开发",
+        "团队`开发",
+        "团队;开发",
+        "团队\u{00a0}开发",
+        "团队\u{200b}开发",
+        "团队\u{202e}开发",
+        "团队／开发",
+    ] {
+        assert!(validate_profile_name(name).is_err(), "{name:?}");
+    }
+}
+
+#[test]
+fn unicode_connection_names_survive_real_toml_save_as_exact_profile_keys() {
+    let data = tempfile::tempdir().unwrap();
+    let (_, revision) = Config::load_with_revision(data.path()).unwrap();
+    let first = "团队开发 API";
+    let second = "Café Production";
+    let first_profile = Profile::from_model("openai:future-native-model").unwrap();
+    let second_profile = Profile::from_model("anthropic:another-native-model").unwrap();
+    let config = Config {
+        default_profile: first.into(),
+        profiles: BTreeMap::from([
+            (first.into(), first_profile),
+            (second.into(), second_profile),
+        ]),
+    };
+    config.save_checked(data.path(), &revision).unwrap();
+    let text = std::fs::read_to_string(data.path().join("config.toml")).unwrap();
+    let document: toml::Value = toml::from_str(&text).unwrap();
+    assert_eq!(document["default_profile"].as_str(), Some(first));
+    let profiles = document["profiles"].as_table().unwrap();
+    assert_eq!(profiles.len(), 2);
+    assert!(profiles.contains_key(first));
+    assert!(profiles.contains_key(second));
+    let restored = Config::load(data.path()).unwrap();
+    assert_eq!(restored.default_profile, first);
+    assert_eq!(
+        serde_json::to_value(restored.profile(None).unwrap()).unwrap(),
+        serde_json::to_value(config.profile(Some(first)).unwrap()).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(restored.profile(Some(second)).unwrap()).unwrap(),
+        serde_json::to_value(config.profile(Some(second)).unwrap()).unwrap()
+    );
+}
+
+#[test]
+fn unicode_credentials_stay_in_distinct_profile_directories_and_invalid_names_cannot_write() {
+    let data = tempfile::tempdir().unwrap();
+    let profile = Profile::from_model("openai:fixture-model").unwrap();
+    let first = "团队开发 API";
+    let second = "Café Production";
+    crate::model::save_api_key(data.path(), first, &profile, "synthetic-first-key").unwrap();
+    crate::model::save_api_key(data.path(), second, &profile, "synthetic-second-key").unwrap();
+    let first_path = crate::model::api_key_file(data.path(), first).unwrap();
+    let second_path = crate::model::api_key_file(data.path(), second).unwrap();
+    assert_eq!(
+        first_path,
+        data.path().join("profiles").join(first).join("api-key")
+    );
+    assert_eq!(
+        second_path,
+        data.path().join("profiles").join(second).join("api-key")
+    );
+    assert_ne!(first_path, second_path);
+    let first_bytes = std::fs::read(&first_path).unwrap();
+    let second_bytes = std::fs::read(&second_path).unwrap();
+    assert_ne!(first_bytes, second_bytes);
+    assert!(crate::model::has_api_key(data.path(), first).unwrap());
+    assert!(crate::model::has_api_key(data.path(), second).unwrap());
+    let subscription = Profile::from_model("chatgpt:fixture-model").unwrap();
+    let auth = crate::model::auth_file(data.path(), first).unwrap();
+    assert_eq!(auth, first_path.with_file_name("auth.json"));
+    assert!(!crate::model::has_login(&subscription, data.path(), first).unwrap());
+    std::fs::write(&auth, br#"{"synthetic_cache":true}"#).unwrap();
+    assert!(crate::model::has_login(&subscription, data.path(), first).unwrap());
+    assert!(!crate::model::has_login(&subscription, data.path(), second).unwrap());
+    for name in [
+        "../outside",
+        "团队/开发",
+        "团队\\开发",
+        "团队\n开发",
+        "[profiles]",
+    ] {
+        assert!(
+            crate::model::save_api_key(data.path(), name, &profile, "synthetic-invalid-key")
+                .is_err()
+        );
+        assert!(crate::model::auth_file(data.path(), name).is_err());
+    }
+    assert_eq!(std::fs::read(&first_path).unwrap(), first_bytes);
+    assert_eq!(std::fs::read(&second_path).unwrap(), second_bytes);
+    crate::model::remove_api_key(data.path(), first).unwrap();
+    assert!(!crate::model::has_api_key(data.path(), first).unwrap());
+    assert!(crate::model::has_api_key(data.path(), second).unwrap());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&second_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(second_path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn unicode_profile_names_preserve_existing_credential_symlink_protection() {
+    let data = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let name = "团队开发 API";
+    std::fs::create_dir(data.path().join("profiles")).unwrap();
+    std::os::unix::fs::symlink(outside.path(), data.path().join("profiles").join(name)).unwrap();
+    let profile = Profile::from_model("openai:fixture-model").unwrap();
+    assert!(crate::model::save_api_key(data.path(), name, &profile, "synthetic-key").is_err());
+    assert!(crate::model::has_api_key(data.path(), name).is_err());
+    assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
+}
+
+#[test]
 fn configuration_save_is_atomic_private_and_rejects_external_revisions() {
     let data = tempfile::tempdir().unwrap();
     let (mut config, revision) = Config::load_with_revision(data.path()).unwrap();

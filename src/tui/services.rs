@@ -13,12 +13,20 @@ use std::{
 use tokio::io::AsyncReadExt;
 
 const DRAFT_LIMIT: usize = 128 * 1024;
+const ALL_DRAFTS_LIMIT: usize = 1024 * 1024;
 const HISTORY_LIMIT: usize = 1024 * 1024;
 const OUTPUT_LIMIT: usize = 2 * 1024 * 1024;
 // JSON escaping can expand a byte to six ASCII bytes.
-const SAVED_LIMIT: usize = 6 * (DRAFT_LIMIT + HISTORY_LIMIT) + 4096;
+const SAVED_LIMIT: usize = 6 * (ALL_DRAFTS_LIMIT + HISTORY_LIMIT) + 32 * 1024;
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedDraft {
+    pub text: String,
+    pub cursor: usize,
+    pub selection: Option<(usize, usize)>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UiSaved {
     pub draft: String,
     pub history: Vec<String>,
@@ -28,6 +36,8 @@ pub struct UiSaved {
     pub cursor: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<(usize, usize)>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub drafts: HashMap<String, SavedDraft>,
 }
 fn session_path(data: &Path, session: &str) -> Result<PathBuf> {
     ensure!(
@@ -53,6 +63,21 @@ fn validate(saved: &UiSaved) -> Result<()> {
         saved.history.len() <= 100
             && saved.history.iter().map(String::len).sum::<usize>() <= HISTORY_LIMIT,
         "input history exceeds 100 entries or 1 MiB"
+    );
+    ensure!(
+        saved.drafts.len() <= 100
+            && saved
+                .drafts
+                .iter()
+                .all(|(target, draft)| { target.len() <= 128 && draft.text.len() <= DRAFT_LIMIT })
+            && saved.draft.len()
+                + saved
+                    .drafts
+                    .values()
+                    .map(|draft| draft.text.len())
+                    .sum::<usize>()
+                <= ALL_DRAFTS_LIMIT,
+        "saved drafts exceed 100 targets, 128 KiB each, or 1 MiB total"
     );
     Ok(())
 }

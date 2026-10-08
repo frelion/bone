@@ -82,7 +82,7 @@ fn session_title_uses_first_real_input_after_initial_stop_and_keeps_narrow_state
     assert!(!current.label.contains("新对话"));
     assert_eq!(current.value, engine.state().id);
     assert!(!current.detail.contains(&engine.state().id));
-    let status_end = current.detail.find("进行中").unwrap() + "进行中".len();
+    let status_end = current.detail.find("运行").unwrap() + "运行".len();
     assert!(unicode_width::UnicodeWidthStr::width(&current.detail[..status_end]) <= 20);
     assert_eq!(engine.events().unwrap().len(), events.len());
     assert!(
@@ -386,14 +386,15 @@ fn admission_notice_follows_exact_input_identity_across_shared_request_roots() {
     );
     admitted.root_input = Some("original-question-root".into());
     app.ingest(&engine, &admitted).unwrap();
-    assert_eq!(app.ui.notice, format!("输入 {} 已纳入执行", short_id(&id)));
+    assert_eq!(app.ui.notice, "新要求已纳入执行");
+    assert_eq!(app.last_admitted_input.as_deref(), Some(id.as_str()));
     let receipt = app
         .ui
         .messages
         .iter()
         .find(|m| m.event_id.as_deref() == Some(id.as_str()))
         .unwrap();
-    assert!(receipt.role.contains("已纳入"));
+    assert_eq!(receipt.kind, MessageKind::User { admitted: true });
     assert_eq!(receipt.text, "new requirement");
 }
 
@@ -545,10 +546,10 @@ fn failed_tool_keeps_reason_first_and_mechanical_success_summary_uses_observed_f
         app.current_status(&engine)
             .contains("最近工具失败 shell failed-c")
     );
-    app.ui.notice = "short operation notice".into();
+    app.ui.notify("short operation notice");
     app.metadata(&engine);
-    app.notice_until = Some(Instant::now());
-    assert!(app.expire_notice());
+    app.ui.notice_until = Some(std::time::Instant::now());
+    assert!(app.ui.expire_notice());
     assert!(app.ui.notice.is_empty());
     assert!(app.current_status(&engine).contains("最近工具失败"));
     let mut success = Event::new(
@@ -647,7 +648,7 @@ fn arriving_question_never_binds_an_empty_or_existing_message_draft() {
     app.bind_reply(&engine, &question.id).unwrap();
     app.metadata(&engine);
     assert!(app.ui.reply_label.contains("Choose an option"));
-    assert!(app.ui.reply_label.contains(&short_id(&question.id)));
+    assert!(!app.ui.reply_label.contains(&short_id(&question.id)));
     assert_eq!(app.reply_target.as_deref(), Some(question.id.as_str()));
     assert_eq!(app.ui.draft(), "");
     app.ui.paste("separate answer");
@@ -1000,7 +1001,7 @@ fn session_titles_skip_blank_lines_and_catalog_keeps_an_old_current_session() {
         .unwrap();
     let items = session_items(&data, &workspace, &engine.state().id).unwrap();
     assert_eq!(items[0].label, "中文标题保留真实内容");
-    assert!(items[0].detail.contains("进行中"));
+    assert!(items[0].detail.contains("运行"));
     assert!(!items[0].detail.contains("轮"));
     assert!(!items[0].label.contains("当前"));
 }
@@ -1012,19 +1013,16 @@ fn sidebar_metadata_uses_real_attention_and_pause_facts_without_inventing_rounds
     job.state = JobState::Waiting;
     let id = job.id.clone();
     state.jobs.insert(id.clone(), job);
-    assert_eq!(session_status(&state, &[]), "等待中");
+    assert_eq!(session_status(&state, &[]), "等待");
     let mut question = Event::new(
         &state.id,
         "question",
         serde_json::json!({"tool_key":"question-key"}),
     );
     question.job_id = Some(id.clone());
-    assert_eq!(session_status(&state, &[question.clone()]), "待回复");
+    assert_eq!(session_status(&state, &[question.clone()]), "回复");
     state.paused = true;
-    assert_eq!(
-        session_status(&state, &[question.clone()]),
-        "待回复 · 已暂停"
-    );
+    assert_eq!(session_status(&state, &[question.clone()]), "回复");
     let answered = Event::new(
         &state.id,
         "tool_result",
@@ -1032,7 +1030,7 @@ fn sidebar_metadata_uses_real_attention_and_pause_facts_without_inventing_rounds
     );
     assert_eq!(
         session_status(&state, &[question.clone(), answered]),
-        "已暂停"
+        "暂停"
     );
     state.unknown_writes.insert(
         "write".into(),
@@ -1043,26 +1041,54 @@ fn sidebar_metadata_uses_real_attention_and_pause_facts_without_inventing_rounds
             tool_name: "shell".into(),
         },
     );
-    assert_eq!(
-        session_status(&state, &[question.clone()]),
-        "待核查 · 已暂停"
-    );
+    assert_eq!(session_status(&state, &[question.clone()]), "核查");
     state.unknown_writes.clear();
     state.jobs.get_mut(&id).unwrap().state = JobState::Closed;
-    assert_eq!(session_status(&state, &[question]), "已暂停");
+    assert_eq!(session_status(&state, &[question]), "");
     state.jobs.get_mut(&id).unwrap().state = JobState::Running;
-    assert_eq!(session_status(&state, &[]), "已暂停");
-    assert_eq!(relative_activity_time(1_000, 60_999), Some("刚刚".into()));
-    assert_eq!(relative_activity_time(1_000, 301_000), Some("5分前".into()));
+    assert_eq!(session_status(&state, &[]), "暂停");
+}
+
+#[tokio::test]
+async fn completed_work_reopens_without_a_spurious_resume_prompt() {
+    let (dir, mut engine, mut app, _server) = execution_feedback_fixture(serde_json::json!([
+        {"text":"检查已完成"}
+    ]));
+    let data = dir.path().join("data");
+    engine.post_message("检查登录边界").unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !engine.is_quiescent() {
+            engine.step().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        engine
+            .state()
+            .jobs
+            .values()
+            .all(|job| job.state == JobState::Idle)
+    );
+    let original = engine.state().id.clone();
+    app.load(&mut engine, &data).unwrap();
+    app.switch_session(&mut engine, &data, None).unwrap();
+    app.switch_session(&mut engine, &data, Some(&original))
+        .unwrap();
+    assert!(engine.state().paused); // Core recovery policy is unchanged.
+    assert!(!app.ui.notice.contains("Ctrl+R"));
+    assert_eq!(app.ui.live_status, "本次已完成");
     assert_eq!(
-        relative_activity_time(1_000, 7_201_000),
-        Some("2小时前".into())
+        session_items(&data, &engine.state().workspace, &original).unwrap()[0].detail,
+        ""
     );
     assert_eq!(
-        relative_activity_time(1_000, 259_201_000),
-        Some("3天前".into())
+        std::fs::read_to_string(dir.path().join("requests.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
     );
-    assert!(relative_activity_time(100, 99).is_none());
 }
 
 #[tokio::test]
@@ -1178,4 +1204,101 @@ fn switching_sessions_and_reopening_restores_the_exact_multiline_input_position(
     reopened.load(&mut engine, &data).unwrap();
     assert_eq!(reopened.ui.input_position(), position);
     assert_eq!(reopened.ui.selected_input_text(), selection);
+}
+
+#[test]
+fn all_target_drafts_survive_session_switch_and_restart_with_their_positions() {
+    let (dir, mut engine, mut app) = local_app();
+    let data = dir.path().join("data");
+    let original = engine.state().id.clone();
+    app.ui.paste("未发送的新要求 👩‍💻\n保留选择");
+    app.ui.handle_key(crossterm::event::KeyEvent::new(
+        KeyCode::Left,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ));
+    let original_draft = app.ui.draft_snapshot().saved();
+    app.switch_target(Some("question-a".into()));
+    app.ui.paste("第一份回答 é");
+    let answer_a = app.ui.draft_snapshot().saved();
+    app.switch_target(Some("question-b".into()));
+    app.ui.paste("第二份回答\n尚未提交");
+    let answer_b = app.ui.draft_snapshot().saved();
+    app.switch_session(&mut engine, &data, None).unwrap();
+    app.switch_session(&mut engine, &data, Some(&original))
+        .unwrap();
+    let mut reopened = App::new(app.settings);
+    reopened.load(&mut engine, &data).unwrap();
+    assert_eq!(reopened.reply_target.as_deref(), Some("question-b"));
+    assert_eq!(reopened.ui.draft_snapshot().saved(), answer_b);
+    reopened.switch_target(Some("question-a".into()));
+    assert_eq!(reopened.ui.draft_snapshot().saved(), answer_a);
+    reopened.cancel_reply();
+    assert_eq!(reopened.ui.draft_snapshot().saved(), original_draft);
+    // Completed questions must not fill the bounded draft file with empty slots.
+    for index in 0..110 {
+        reopened.switch_target(Some(format!("completed-question-{index}")));
+    }
+    reopened.cancel_reply();
+    reopened.save(&engine, &data).unwrap();
+    assert_eq!(reopened.ui.draft_snapshot().saved(), original_draft);
+    assert!(
+        engine
+            .events()
+            .unwrap()
+            .iter()
+            .all(|event| !matches!(event.kind.as_str(), "model_started" | "tool_started"))
+    );
+}
+
+#[test]
+fn a_new_async_failure_does_not_inherit_an_expired_success_notice_timer() {
+    let (_, _, mut app) = local_app();
+    app.ui.notify("旧操作完成");
+    app.ui.notice_until = Some(std::time::Instant::now());
+    app.ui.fail("导出失败：磁盘已满");
+    assert!(!app.ui.expire_notice());
+    assert_eq!(app.ui.notice, "导出失败：磁盘已满");
+    assert_eq!(app.ui.notice_tone, Tone::Error);
+    app.ui.notify("后续操作完成");
+    assert!(app.ui.notice_until.is_some());
+}
+
+#[tokio::test]
+async fn a_completed_export_keeps_the_active_form_and_parent_draft() {
+    let (dir, mut engine, mut app) = local_app();
+    app.ui.paste("继续修复之前先保留这份草稿");
+    app.ui.open_form(
+        "连接",
+        vec![view::FormField {
+            label: "模型".into(),
+            value: "local-model".into(),
+            secret: false,
+        }],
+    );
+    let values = app.ui.form_values();
+    let path = dir.path().join("report.html");
+    let result = path.clone();
+    app.export = Some(tokio::spawn(async move { Ok(result) }));
+    while app.export.is_some() {
+        app.tasks(&mut engine, &dir.path().join("data")).await;
+        tokio::task::yield_now().await;
+    }
+    assert!(app.ui.form_is_open());
+    assert_eq!(app.ui.form_values(), values);
+    assert!(app.ui.detail.is_none());
+    assert_eq!(app.exported_report.as_deref(), Some(path.as_path()));
+    app.commands(&engine, String::new());
+    assert!(
+        app.ui
+            .picker
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .any(|item| item.value == "/export show")
+    );
+    app.ui.close_layer();
+    app.ui.close_layer();
+    assert_eq!(app.ui.draft(), "继续修复之前先保留这份草稿");
+    assert!(engine.events().unwrap().is_empty());
 }

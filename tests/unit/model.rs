@@ -404,7 +404,7 @@ async fn invalid_oauth_cache_reports_login_without_cache_contents() {
         Err(error) => error,
     };
     let message = format!("{error:#}");
-    assert!(message.contains("bone login --profile test"));
+    assert!(message.contains("bone login --profile 'test'"));
     assert!(!message.contains("synthetic-sensitive-invalid-cache"));
 }
 

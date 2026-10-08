@@ -22,7 +22,10 @@ use std::io::{IsTerminal, stdout};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::time::Instant;
-use view::{Activity, Draft, Focus, FormField, Message, PickerItem, PickerKind, Tone, View};
+use view::{
+    Activity, Draft, Focus, FormField, InputTarget, Message, MessageKind, PickerItem, PickerKind,
+    Tone, ToolState, View,
+};
 
 /// Concrete launch recipes, not a second runtime or model abstraction.
 pub(super) struct Settings {
@@ -142,6 +145,7 @@ struct App {
     login_codes: Option<tokio::sync::mpsc::Receiver<DeviceCodePrompt>>,
     diff: Option<tokio::task::JoinHandle<Result<String>>>,
     export: Option<tokio::task::JoinHandle<Result<PathBuf>>>,
+    exported_report: Option<PathBuf>,
     search: Option<tokio::task::JoinHandle<Result<Vec<PickerItem>>>>,
     search_query: String,
     completion_key: Option<(String, usize)>,
@@ -153,8 +157,6 @@ struct App {
     detail_event: Option<String>,
     detail_sources: BTreeMap<String, String>,
     last_tool_failure: Option<String>,
-    notice_seen: String,
-    notice_until: Option<Instant>,
     mouse_capture: bool,
 }
 impl App {
@@ -180,6 +182,7 @@ impl App {
             login_codes: None,
             diff: None,
             export: None,
+            exported_report: None,
             search: None,
             search_query: String::new(),
             completion_key: None,
@@ -191,8 +194,6 @@ impl App {
             detail_event: None,
             detail_sources: BTreeMap::new(),
             last_tool_failure: None,
-            notice_seen: String::new(),
-            notice_until: None,
             mouse_capture: true,
         }
     }
@@ -207,8 +208,6 @@ impl App {
         self.detail_event = None;
         self.detail_sources.clear();
         self.last_tool_failure = None;
-        self.notice_seen.clear();
-        self.notice_until = None;
         self.completion_key = None;
         self.search_query.clear();
         abort_task(&mut self.search);
@@ -225,6 +224,7 @@ impl App {
         self.connection_setup = None;
         abort_task(&mut self.diff);
         abort_task(&mut self.export);
+        self.exported_report = None;
         // Read one original at a time: native responses can be several MiB.
         // Keep IDs during the backward traversal, then project in append order.
         let mut ids = Vec::new();
@@ -242,7 +242,7 @@ impl App {
                 break;
             }
         }
-        self.older = ids.last().cloned();
+        self.older = more.then(|| ids.last().cloned()).flatten();
         self.cursor = ids.first().cloned();
         for id in ids.iter().rev() {
             self.ingest(engine, &engine.read_event(id)?)?;
@@ -252,12 +252,6 @@ impl App {
                 self.ingest(engine, &engine.read_event(&question.id)?)?;
             }
         }
-        self.ui.notice = if more {
-            "已加载最近记录；/older 往前翻页 · Ctrl+F 搜索全部原文"
-        } else {
-            "Enter 发送 · Ctrl+P 操作 · F1 帮助"
-        }
-        .into();
         match services::load(data, &engine.state().id) {
             Ok(saved) => {
                 if !saved.history.is_empty() {
@@ -267,14 +261,22 @@ impl App {
                 self.ui
                     .restore_input_position(saved.cursor, saved.selection);
                 self.reply_target = saved.reply_to.clone();
+                self.drafts = saved
+                    .drafts
+                    .iter()
+                    .filter(|(target, _)| {
+                        target.as_str() != saved.reply_to.as_deref().unwrap_or("")
+                    })
+                    .map(|(target, draft)| (target.clone(), view::Draft::restored(draft)))
+                    .collect();
                 self.last_saved = saved;
                 if !self.ui.draft().is_empty() {
-                    self.ui.notice = "已恢复未发送的草稿；Enter 才发送".into();
+                    self.ui.notify("已恢复未发送的草稿；Enter 才发送");
                 }
             }
             Err(error) => {
                 self.last_saved = services::UiSaved::default();
-                self.ui.notice = format!("草稿恢复失败：{error:#}");
+                self.ui.fail(format!("草稿恢复失败：{error:#}"));
             }
         }
         self.changed_at = None;
@@ -305,7 +307,8 @@ impl App {
         }
         self.metadata(engine);
         refreshed?;
-        self.ui.notice = "已返回最新记录；草稿、光标、选区与回复目标已保留".into();
+        self.ui
+            .notify("已返回最新记录；草稿、光标、选区与回复目标已保留");
         Ok(())
     }
     fn save(&mut self, engine: &Engine, data: &Path) -> Result<()> {
@@ -319,13 +322,13 @@ impl App {
             reply_to: self.reply_target.clone(),
             cursor: Some(cursor),
             selection,
+            drafts: self
+                .drafts
+                .iter()
+                .map(|(target, draft)| (target.clone(), draft.saved()))
+                .collect(),
         };
-        if saved.draft != self.last_saved.draft
-            || saved.history != self.last_saved.history
-            || saved.reply_to != self.last_saved.reply_to
-            || saved.cursor != self.last_saved.cursor
-            || saved.selection != self.last_saved.selection
-        {
+        if saved != self.last_saved {
             services::save(data, &engine.state().id, &saved)?;
             self.last_saved = saved;
         }
@@ -349,10 +352,7 @@ impl App {
             && event.data["input_id"].as_str() == self.last_input.as_deref()
         {
             self.last_admitted_input = self.last_input.clone();
-            self.ui.notice = format!(
-                "输入 {} 已纳入执行",
-                short_id(self.last_input.as_deref().unwrap_or(""))
-            );
+            self.ui.notify("新要求已纳入执行");
         }
         if event.kind == "input" && event.data["source"] == "user" {
             self.last_input = Some(event.id.clone());
@@ -379,7 +379,7 @@ impl App {
             self.tool_previews.remove(call);
         }
         if event.kind == "question" && engine.is_unanswered_question(event) {
-            self.ui.notice = "有问题待回答 · Ctrl+P 选择回复".into();
+            self.ui.notify("有问题待回答 · Ctrl+P 选择回复");
         }
         if event.kind == "tool_result" && tool_failed(engine, event)? {
             self.last_tool_failure = Some(format!(
@@ -448,9 +448,6 @@ impl App {
         let mut refresh_sessions = false;
         loop {
             let page = bone::history_page(data, &engine.state().id, self.cursor.as_deref(), 20)?;
-            if self.older.is_none() {
-                self.older = page.events.first().map(|e| e.id.clone());
-            }
             for event in &page.events {
                 refresh_sessions |= matches!(
                     event.kind.as_str(),
@@ -474,36 +471,34 @@ impl App {
     }
     fn metadata(&mut self, engine: &Engine) {
         let questions = engine.unanswered_questions();
+        self.ui.input_target = if self.reconcile_call.is_some() {
+            InputTarget::Reconcile
+        } else if self.reply_target.is_some() {
+            InputTarget::Reply
+        } else {
+            InputTarget::Message
+        };
         self.ui.reply_label = if let Some(call) = &self.reconcile_call {
             format!(
-                "核查 {} · Enter 记录 · Esc 取消 · Ctrl+D 证据",
-                short_id(call)
+                "核查：{}（结果未知）",
+                engine
+                    .state()
+                    .unknown_writes
+                    .get(call)
+                    .map_or("写入操作", |write| write.tool_name.as_str())
             )
         } else if let Some(id) = &self.reply_target {
             if let Some(question) = questions.iter().find(|q| &q.id == id) {
                 format!(
-                    "回复 {} · {} · Enter 发送 · /message",
-                    short_id(id),
-                    question_summary(question.data["question"].as_str().unwrap_or("问题"), 24)
+                    "回复：{}",
+                    question_summary(question.data["question"].as_str().unwrap_or("问题"), 80)
                 )
             } else {
-                "回复目标失效 · 草稿保留 · Ctrl+P 写新要求".into()
+                "回复目标已失效 · 草稿保留".into()
             }
         } else {
-            format!(
-                "新要求 · Enter 发送{}",
-                if questions.is_empty() {
-                    ""
-                } else {
-                    " · Ctrl+P 回复问题"
-                }
-            )
+            String::new()
         };
-        if self.ui.notice != self.notice_seen {
-            self.notice_seen = self.ui.notice.clone();
-            self.notice_until =
-                (!self.ui.notice.is_empty()).then(|| Instant::now() + Duration::from_secs(8));
-        }
         self.cache_active_calls(engine);
         self.ui.busy = execution_active(engine.state());
         self.ui.spinner_tick = if self.ui.busy {
@@ -694,7 +689,7 @@ impl App {
             let text = parts.values().cloned().collect::<Vec<_>>().join("\n\n");
             self.ui.upsert_message(Message {
                 summary: None,
-                role: "Agent · 输出中（未交付）".into(),
+                kind: MessageKind::Streaming,
                 text,
                 event_id: Some(format!("live:{}", progress.call_id)),
             });
@@ -722,7 +717,10 @@ impl App {
             );
             self.ui.upsert_message(Message {
                 summary: None,
-                role: format!("工具 · {}", progress.tool_name),
+                kind: MessageKind::Tool {
+                    name: progress.tool_name,
+                    state: ToolState::Running,
+                },
                 text: format!(
                     "执行中 · 实时日志（尾部预览，最终记录保留原文）\nstdout:\n{}\nstderr:\n{}",
                     progress.stdout, progress.stderr
@@ -746,6 +744,9 @@ impl App {
             items.push(action("核查未确认写入", "/reconcile", "记录实际结果后继续"));
         }
         items.push(action("查看项目修改", "/diff", "Git 修改 · Ctrl+D"));
+        if self.exported_report.is_some() {
+            items.push(action("查看导出报告", "/export show", "报告文件的完整路径"));
+        }
         self.ui.open_picker(PickerKind::Command, items, query);
     }
     fn refresh_sessions(&mut self, engine: &Engine, data: &Path) {
@@ -1089,8 +1090,10 @@ impl App {
             .profiles
             .insert(change.name.clone(), change.profile.clone());
         change.config.default_profile = change.name.clone();
-        pause(engine, &mut self.ui)?;
-        self.clear_preview();
+        if !engine.is_quiescent() {
+            pause(engine, &mut self.ui)?;
+            self.clear_preview();
+        }
         let old_name = self.settings.profile_name.clone();
         let old_profile = self.settings.profile.clone();
         engine.set_profile(change.profile.clone(), change.name.clone())?;
@@ -1107,8 +1110,17 @@ impl App {
         }
         self.settings.profile_name = change.name;
         self.settings.profile = change.profile;
-        self.ui.notice = warning
-            .unwrap_or_else(|| "连接与模型已保存 · 首次请求验证认证 · Ctrl+R 继续工作".into());
+        if let Some(warning) = warning {
+            self.ui.fail(warning);
+        } else {
+            self.ui.notify(
+                if engine.state().paused && has_unfinished_work(engine.state()) {
+                    "连接与模型已保存 · 首次请求验证认证 · Ctrl+R 继续工作"
+                } else {
+                    "连接与模型已保存 · 下次请求使用新模型"
+                },
+            );
+        }
         Ok(())
     }
     fn cancel_login(&mut self) {
@@ -1139,7 +1151,7 @@ impl App {
             self.ui
                 .open_picker(PickerKind::File, file_items(files), query);
         } else {
-            self.ui.notice = "正在索引项目文件…".into();
+            self.ui.notify("正在索引项目文件…");
             self.ui.open_picker(PickerKind::File, Vec::new(), query);
             let workspace = engine.state().workspace.clone();
             if self.file_index.is_none() {
@@ -1179,14 +1191,15 @@ impl App {
             self.ui.focus = Focus::Sessions;
             self.ui.main_focus = return_focus;
         }
-        self.ui.notice = if id.is_some() && engine.state().paused {
-            "会话已打开 · 已暂停，Ctrl+R 继续"
-        } else if id.is_some() {
-            "会话已打开"
-        } else {
-            "新会话已创建；直接描述任务"
-        }
-        .into();
+        self.ui.notify(
+            if id.is_some() && engine.state().paused && has_unfinished_work(engine.state()) {
+                "会话已打开 · 已暂停，Ctrl+R 继续"
+            } else if id.is_some() {
+                "会话已打开"
+            } else {
+                "新会话已创建；直接描述任务"
+            },
+        );
         Ok(())
     }
     fn set_model(&mut self, engine: &mut Engine, data: &Path, value: &str) -> Result<()> {
@@ -1283,7 +1296,7 @@ impl App {
             _ => {}
         }
         self.completion_key = Some((self.ui.draft(), self.ui.cursor()));
-        self.ui.notice = "已补全；Enter 才执行或发送".into();
+        self.ui.notify("已补全；Enter 才执行或发送");
     }
     fn start_search(&mut self, engine: &Engine, data: &Path, query: &str) {
         abort_task(&mut self.search);
@@ -1315,7 +1328,7 @@ impl App {
         }
         let data = data.to_owned();
         let id = engine.state().id.clone();
-        self.ui.notice = "正在搜索完整会话原文…".into();
+        self.ui.notify("正在搜索完整会话原文…");
         self.search = Some(tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(200)).await;
             tokio::task::spawn_blocking(move || {
@@ -1337,21 +1350,17 @@ impl App {
             .iter()
             .map(|q| PickerItem {
                 label: q.data["question"].as_str().unwrap_or("问题").into(),
-                detail: format!(
-                    "{}{}",
-                    q.id,
-                    if self.reply_target.as_ref() == Some(&q.id) {
-                        " · 当前回复目标"
-                    } else {
-                        ""
-                    }
-                ),
+                detail: if self.reply_target.as_ref() == Some(&q.id) {
+                    "当前回复目标".into()
+                } else {
+                    String::new()
+                },
                 value: q.id.clone(),
             })
             .collect();
         self.ui
             .open_picker(PickerKind::Question, items, String::new());
-        self.ui.notice = "选择要回答的问题；Esc 返回，草稿保留".into();
+        self.ui.notify("选择要回答的问题；Esc 返回，草稿保留");
     }
     fn switch_target(&mut self, target: Option<String>) {
         while self.ui.has_modal() || self.ui.show_activity {
@@ -1362,7 +1371,11 @@ impl App {
             return;
         }
         let previous = self.reply_target.clone().unwrap_or_default();
-        self.drafts.insert(previous, self.ui.draft_snapshot());
+        if self.ui.draft().is_empty() {
+            self.drafts.remove(&previous);
+        } else {
+            self.drafts.insert(previous, self.ui.draft_snapshot());
+        }
         let next = target.clone().unwrap_or_default();
         let draft = self.drafts.remove(&next).unwrap_or_else(View::empty_draft);
         self.ui.restore_draft(draft);
@@ -1380,7 +1393,7 @@ impl App {
     }
     fn cancel_reply(&mut self) {
         self.switch_target(None);
-        self.ui.notice = "已切换新要求草稿；Enter 发送新要求".into();
+        self.ui.notify("已切换新要求草稿；Enter 发送新要求");
     }
     fn begin_reconcile(&mut self, engine: &mut Engine, call: &str) -> Result<()> {
         ensure!(
@@ -1394,8 +1407,8 @@ impl App {
         pause(engine, &mut self.ui)?;
         self.ui.begin_temporary_draft();
         self.reconcile_call = Some(call.to_owned());
-        self.ui.notice =
-            "核查表单：填写检查过程和实际效果；Enter 记录，Esc 取消，Ctrl+D 阅读证据".into();
+        self.ui
+            .notify("核查表单：填写检查过程和实际效果；Enter 记录，Esc 取消，Ctrl+D 阅读证据");
         self.metadata(engine);
         Ok(())
     }
@@ -1429,27 +1442,17 @@ impl App {
     fn cancel_reconcile(&mut self) {
         self.ui.restore_temporary_draft();
         self.reconcile_call = None;
-        self.ui.notice = "已取消核查；原草稿、目标与阅读位置已恢复，执行仍暂停".into();
+        self.ui
+            .notify("已取消核查；原草稿、目标与阅读位置已恢复，执行仍暂停");
     }
     fn submit_reconcile(&mut self, engine: &mut Engine) -> Result<()> {
         let call = self.reconcile_call.as_deref().context("没有核查表单")?;
         engine.resolve_write(call, self.ui.draft().trim())?;
         self.ui.restore_temporary_draft();
         self.reconcile_call = None;
-        self.ui.notice = "已记录核查结果；执行仍暂停，Ctrl+R 显式恢复".into();
+        self.ui
+            .notify("已记录核查结果；执行仍暂停，Ctrl+R 显式恢复");
         Ok(())
-    }
-    fn expire_notice(&mut self) -> bool {
-        if self
-            .notice_until
-            .is_some_and(|until| Instant::now() >= until)
-        {
-            self.ui.notice.clear();
-            self.notice_seen.clear();
-            self.notice_until = None;
-            return true;
-        }
-        false
     }
     fn current_status(&self, engine: &Engine) -> String {
         if !engine.state().paused
@@ -1541,7 +1544,8 @@ impl App {
             .collect();
         self.ui
             .open_picker(PickerKind::Reconcile, items, String::new());
-        self.ui.notice = "先检查实际文件/进程结果，记录核查结论后显式恢复".into();
+        self.ui
+            .notify("先检查实际文件/进程结果，记录核查结论后显式恢复");
     }
     fn selected_record(&self, engine: &Engine) -> Option<String> {
         let id = self.ui.selected_message_id()?;
@@ -1561,11 +1565,7 @@ impl App {
         let id = self
             .selected_record(engine)
             .context("选择一条持久消息后查看原文")?;
-        let observation = self
-            .ui
-            .selected_message()
-            .filter(|m| m.text.starts_with("执行中 · 实时日志"))
-            .map(|m| m.text.clone());
+        let observation = self.selected_tool_observation().map(|m| m.text.clone());
         let source = detail(engine, &engine.read_event(&id)?)?;
         let title = if observation.is_some() {
             format!("实时观察快照 · {} · 未交付", short_id(&id))
@@ -1579,6 +1579,21 @@ impl App {
         self.ui.open_detail(title, text);
         self.remember_detail_source();
         Ok(())
+    }
+    fn selected_tool_observation(&self) -> Option<&Message> {
+        self.ui.selected_message().filter(|message| {
+            matches!(
+                message.kind,
+                MessageKind::Tool {
+                    state: ToolState::Running,
+                    ..
+                }
+            ) && message
+                .event_id
+                .as_deref()
+                .and_then(|id| id.strip_prefix("tool:"))
+                .is_some_and(|call| self.tool_observations.contains_key(call))
+        })
     }
     async fn copy_selected(&mut self, engine: &Engine) -> Result<()> {
         ensure!(
@@ -1610,11 +1625,7 @@ impl App {
                 };
                 (label.into(), self.ui.draft())
             }
-        } else if self.ui.focus == Focus::Conversation
-            && self
-                .ui
-                .selected_message()
-                .is_some_and(|m| m.text.starts_with("执行中 · 实时日志"))
+        } else if self.ui.focus == Focus::Conversation && self.selected_tool_observation().is_some()
         {
             (
                 "实时观察尾部（未交付）".into(),
@@ -1637,27 +1648,31 @@ impl App {
         };
         ensure!(!text.is_empty(), "{object}没有可复制文字");
         copy_to_clipboard(&text).await?;
-        self.ui.notice = format!("已复制{object}完整文字");
+        self.ui.notify(format!("已复制{object}完整文字"));
         Ok(())
     }
     fn load_older(&mut self, engine: &Engine, data: &Path) -> Result<()> {
-        let page = bone::history_before(data, &engine.state().id, self.older.as_deref(), 20)?;
+        let Some(before) = self.older.as_deref() else {
+            self.ui.notify("已经是最早的记录");
+            return Ok(());
+        };
+        let page = bone::history_before(data, &engine.state().id, Some(before), 20)?;
         if page.events.is_empty() {
-            self.ui.notice = "已经是最早的记录".into();
+            self.older = None;
+            self.ui.notify("已经是最早的记录");
             return Ok(());
         }
         let mut earlier = View::new();
         for event in &page.events {
             ingest(engine, event, &mut earlier)?;
         }
-        self.older = page.next_cursor;
+        self.older = page.has_more.then_some(page.next_cursor).flatten();
         self.ui.prepend_messages(earlier.messages);
-        self.ui.notice = if page.has_more {
-            "已载入更早对话；/older 继续向前，Ctrl+F 搜索全记录"
+        self.ui.notify(if page.has_more {
+            "已载入更早对话"
         } else {
             "已载入最早对话"
-        }
-        .into();
+        });
         Ok(())
     }
     fn has_tasks(&self) -> bool {
@@ -1705,10 +1720,10 @@ impl App {
                     {
                         picker.items = items;
                         picker.selected = 0;
-                        self.ui.notice = "搜索完整持久记录；Enter 阅读原文，Esc 返回".into();
+                        self.ui.notify("搜索完整持久记录；Enter 阅读原文，Esc 返回");
                     }
                 }
-                Err(error) => self.ui.notice = format!("搜索失败：{error:#}"),
+                Err(error) => self.ui.fail(format!("搜索失败：{error:#}")),
             }
         }
         if let Some(result) = finished_task(&mut self.session_index).await {
@@ -1740,9 +1755,9 @@ impl App {
                         picker.items = file_items(&files);
                     }
                     self.files = Some(files);
-                    self.ui.notice = "文件引用只插入草稿；发送后读取文件".into();
+                    self.ui.notify("文件引用只插入草稿；发送后读取文件");
                 }
-                Err(error) => self.ui.notice = format!("文件索引失败：{error:#}"),
+                Err(error) => self.ui.fail(format!("文件索引失败：{error:#}")),
             }
         }
         if let Some(result) = finished_task(&mut self.diff).await {
@@ -1757,26 +1772,37 @@ impl App {
                         self.ui.detail = Some(("项目修改（只读）".into(), text));
                     }
                 }
-                Err(error) => self.ui.notice = format!("修改检查失败：{error:#}"),
+                Err(error) => self.ui.fail(format!("修改检查失败：{error:#}")),
             }
         }
         if let Some(result) = finished_task(&mut self.export).await {
             match result {
                 Ok(path) => {
-                    self.ui.notice = "HTML 导出完成".into();
-                    self.detail_event = None;
-                    self.ui.open_detail(
-                        "HTML 导出完成",
-                        format!(
-                            "{}\n\n报告包含持久化对话、工具行动和归属信息。可以用浏览器打开这个本地文件。",
-                            path.display()
-                        ),
-                    );
+                    self.ui.notify("报告已导出 · Ctrl+P 查看导出报告");
+                    self.exported_report = Some(path);
                 }
-                Err(error) => self.ui.notice = format!("导出失败：{error:#}"),
+                Err(error) => self.ui.fail(format!("导出失败：{error:#}")),
             }
         }
     }
+    async fn submit_command(
+        &mut self,
+        engine: &mut Engine,
+        data: &Path,
+        terminal: &mut Terminal,
+        input: &mut Option<EventStream>,
+        text: &str,
+    ) -> Result<bool> {
+        let draft = self.ui.draft_snapshot();
+        self.ui.close_completion();
+        self.ui.take_draft();
+        let result = self.command(engine, data, terminal, input, text).await;
+        if result.is_err() {
+            self.ui.restore_draft(draft);
+        }
+        result
+    }
+
     async fn command(
         &mut self,
         engine: &mut Engine,
@@ -1835,7 +1861,8 @@ impl App {
                 } else if let Some((call, note)) = args.split_once(char::is_whitespace) {
                     pause(engine, &mut self.ui)?;
                     engine.resolve_write(call, note.trim())?;
-                    self.ui.notice = "已记录核查结果；执行仍暂停，Ctrl+R 显式恢复".into();
+                    self.ui
+                        .notify("已记录核查结果；执行仍暂停，Ctrl+R 显式恢复");
                 } else {
                     self.begin_reconcile(engine, args)?;
                 }
@@ -1847,12 +1874,11 @@ impl App {
                 } else {
                     execute!(stdout(), DisableMouseCapture)?;
                 }
-                self.ui.notice = if self.mouse_capture {
+                self.ui.notify(if self.mouse_capture {
                     "鼠标滚动已启用；/mouse 切换原生文本选择"
                 } else {
                     "终端文本选择已启用；/mouse 恢复鼠标滚动"
-                }
-                .into();
+                });
             }
             "/details" => self.ui.toggle_inspector(),
             "/status" => {
@@ -1890,13 +1916,24 @@ impl App {
                 self.start_diff(engine);
             }
             "/export" => {
-                ensure!(self.export.is_none(), "export is already running");
-                let data = data.to_owned();
-                let id = engine.state().id.clone();
-                self.export = Some(tokio::task::spawn_blocking(move || {
-                    services::export(&data, &id)
-                }));
-                self.ui.notice = "正在导出对话和行动记录…".into();
+                if args == "show" {
+                    let path = self.exported_report.as_ref().context("本次尚未导出报告")?;
+                    self.detail_event = None;
+                    self.ui
+                        .open_detail("导出报告 · Ctrl+Y 复制路径", path.display().to_string());
+                } else {
+                    ensure!(
+                        args.is_empty(),
+                        "使用 /export 导出，或 /export show 查看已导出的路径"
+                    );
+                    ensure!(self.export.is_none(), "export is already running");
+                    let data = data.to_owned();
+                    let id = engine.state().id.clone();
+                    self.export = Some(tokio::task::spawn_blocking(move || {
+                        services::export(&data, &id)
+                    }));
+                    self.ui.notify("正在导出对话和行动记录…");
+                }
             }
             "/copy" => self.copy_selected(engine).await?,
             "/older" => self.load_older(engine, data)?,
@@ -1996,7 +2033,8 @@ impl App {
         let text = edited?;
         self.ui.take_draft();
         self.ui.paste(&text);
-        self.ui.notice = "已返回编辑后的草稿，Enter 才发送；工作已暂停".into();
+        self.ui
+            .notify("已返回编辑后的草稿，Enter 才发送；工作已暂停");
         self.save(engine, data)?;
         Ok(())
     }
@@ -2140,14 +2178,6 @@ fn session_items(data: &Path, workspace: &Path, current: &str) -> Result<Vec<Pic
          AND json_extract(COALESCE(metadata, payload), '$.kind') IN ('question','tool_result')
          ORDER BY sequence",
     )?;
-    let mut latest = connection.prepare(
-        "SELECT COALESCE(metadata, payload) FROM events WHERE session_id = ?1
-         ORDER BY sequence DESC LIMIT 1",
-    )?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_millis()
-        .min(u64::MAX as u128) as u64;
     let mut items = Vec::new();
     for snapshot in snapshots {
         let session: bone::state::SessionState = serde_json::from_str(&snapshot?)?;
@@ -2172,25 +2202,9 @@ fn session_items(data: &Path, workspace: &Path, current: &str) -> Result<Vec<Pic
             .query_map([&session.id], |row| row.get::<_, String>(0))?
             .map(|row| Ok(serde_json::from_str::<Event>(&row?)?))
             .collect::<Result<Vec<_>>>()?;
-        let last = latest
-            .query_map([&session.id], |row| row.get::<_, String>(0))?
-            .next()
-            .transpose()?
-            .map(|payload| serde_json::from_str::<Event>(&payload))
-            .transpose()?;
-        let status = session_status(&session, &events);
-        let time = last
-            .as_ref()
-            .and_then(|event| event.timestamp.parse().ok())
-            .and_then(|stamp| relative_activity_time(stamp, now));
-        let detail = [(!status.is_empty()).then(|| status.to_owned()), time]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join(" · ");
         items.push(PickerItem {
             label: title.unwrap_or_else(|| "新会话".into()),
-            detail,
+            detail: session_status(&session, &events).into(),
             value: session.id,
         });
     }
@@ -2214,49 +2228,28 @@ fn session_status(session: &bone::state::SessionState, events: &[Event]) -> &'st
                 .is_some_and(|key| !answered.contains(key))
     });
     if !session.unknown_writes.is_empty() {
-        if session.paused {
-            "待核查 · 已暂停"
-        } else {
-            "待核查"
-        }
+        "核查"
     } else if has_question {
-        if session.paused {
-            "待回复 · 已暂停"
-        } else {
-            "待回复"
-        }
-    } else if session.paused {
-        "已暂停"
+        "回复"
+    } else if session.paused && has_unfinished_work(session) {
+        "暂停"
     } else if !session.pending_inputs.is_empty()
         || session
             .jobs
             .values()
             .any(|job| matches!(job.state, JobState::Ready | JobState::Running))
     {
-        "进行中"
+        "运行"
     } else if session
         .jobs
         .values()
         .any(|job| job.state == JobState::Waiting)
     {
-        "等待中"
+        "等待"
     } else {
         ""
     }
 }
-fn relative_activity_time(stamp: u64, now: u64) -> Option<String> {
-    let age = now.checked_sub(stamp)? / 1_000;
-    Some(if age < 60 {
-        "刚刚".into()
-    } else if age < 3_600 {
-        format!("{}分前", age / 60)
-    } else if age < 86_400 {
-        format!("{}小时前", age / 3_600)
-    } else {
-        format!("{}天前", age / 86_400)
-    })
-}
-
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
@@ -2304,13 +2297,13 @@ fn pause(engine: &mut Engine, ui: &mut View) -> Result<()> {
     if !engine.state().paused {
         engine.stop()?;
     }
-    ui.notice = "工作已暂停；Ctrl+R 恢复，Ctrl+Q 退出".into();
+    ui.notify("工作已暂停；Ctrl+R 恢复，Ctrl+Q 退出");
     Ok(())
 }
 fn resume(engine: &mut Engine, ui: &mut View) {
     match engine.resume() {
-        Ok(()) => ui.notice = "已恢复；可以继续补充要求".into(),
-        Err(error) => ui.notice = format!("无法恢复：{error:#}"),
+        Ok(()) => ui.notify("已恢复；可以继续补充要求"),
+        Err(error) => ui.fail(format!("无法恢复：{error:#}")),
     }
 }
 
@@ -2337,7 +2330,7 @@ pub(super) async fn run(
     app.cancel_login();
     drop(terminal);
     eprintln!(
-        "Session: {}\n继续：bone --data-dir {} --profile {} --model {} tui --session {} --workspace {}{}\n打开后 Ctrl+R 恢复暂停的工作。",
+        "Session: {}\n继续：bone --data-dir {} --profile {} --model {} tui --session {} --workspace {}{}\n{}",
         engine.state().id,
         shell_quote(&data.to_string_lossy()),
         shell_quote(&app.settings.profile_name),
@@ -2348,7 +2341,14 @@ pub(super) async fn run(
             " --read-only"
         } else {
             ""
-        }
+        },
+        if !engine.state().unknown_writes.is_empty() {
+            "先核查未确认写入，再继续工作。"
+        } else if has_unfinished_work(engine.state()) {
+            "打开后 Ctrl+R 恢复暂停的工作。"
+        } else {
+            "打开后可继续提出要求。"
+        },
     );
     result?;
     saved?;
@@ -2396,15 +2396,20 @@ async fn event_loop(
                 let revision = engine.state().revision;
                 match event? {
                     TerminalEvent::Key(key) if key.kind != KeyEventKind::Release => {
+                        if app.ui.notice_tone == Tone::Error && !app.ui.has_modal() && app.ui.focus == Focus::Input
+                            && (key.code == KeyCode::Esc || key.code == KeyCode::Backspace || key.code == KeyCode::Delete
+                                || matches!(key.code, KeyCode::Char(_)) && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)) {
+                            app.ui.notify("");
+                        }
                         let control = key.modifiers.contains(KeyModifiers::CONTROL);
                         match key.code {
                             KeyCode::Char('q') if control => return Ok(()),
                             KeyCode::Char('c') if control => {
                                 pause(engine, &mut app.ui)?; app.clear_preview(); deadline = None;
-                                if app.login.is_some() { app.cancel_login(); app.ui.close_layer(); app.ui.notice = "登录已取消，当前连接保留".into(); }
+                                if app.login.is_some() { app.cancel_login(); app.ui.close_layer(); app.ui.notify("登录已取消，当前连接保留"); }
                             },
-                            KeyCode::Char('y') if control => { if let Err(error) = app.copy_selected(engine).await { app.ui.notice = format!("复制失败：{error:#}"); } },
-                            KeyCode::Esc if app.login.is_some() => { app.cancel_login(); app.ui.close_layer(); app.ui.notice = "登录已取消，当前连接和草稿保留".into(); },
+                            KeyCode::Char('y') if control => { if let Err(error) = app.copy_selected(engine).await { app.ui.fail(format!("复制失败：{error:#}")); } },
+                            KeyCode::Esc if app.login.is_some() => { app.cancel_login(); app.ui.close_layer(); app.ui.notify("登录已取消，当前连接和草稿保留"); },
                             KeyCode::F(1) if app.login.is_some() => {},
                             _ if app.login.is_some() => app.ui.handle_key(key),
                             KeyCode::Esc if app.ui.form_is_open() => { app.ui.close_layer(); app.connection_setup = None; },
@@ -2418,30 +2423,38 @@ async fn event_loop(
                                 if let Some(call) = app.reconcile_call.clone() {
                                     match reconciliation_detail(engine, &call) {
                                         Ok(text) => { app.detail_event = engine.read_call_event(&call, "tool_result").or_else(|_| engine.read_call_event(&call, "tool_started")).ok().map(|e| e.id); app.ui.open_detail(format!("核查证据 · {}", short_id(&call)), text); app.remember_detail_source(); },
-                                        Err(error) => app.ui.notice = format!("读取核查证据失败：{error:#}"),
+                                        Err(error) => app.ui.fail(format!("读取核查证据失败：{error:#}")),
                                     }
                                 }
                             },
                             KeyCode::Char('d') if control => app.start_diff(engine),
                             KeyCode::Char('D') if !control && (app.ui.detail.is_some() || app.ui.focus == Focus::Conversation) => {
-                                if let Err(error) = app.open_audit(engine) { app.ui.notice = format!("读取审计失败：{error:#}"); }
+                                if let Err(error) = app.open_audit(engine) { app.ui.fail(format!("读取审计失败：{error:#}")); }
                             },
                             KeyCode::Char('d') if app.ui.focus == Focus::Conversation && !app.ui.has_modal() => {
-                                if let Err(error) = app.open_selected(engine) { app.ui.notice = format!("读取失败：{error:#}"); }
+                                if let Err(error) = app.open_selected(engine) { app.ui.fail(format!("读取失败：{error:#}")); }
                             },
                             KeyCode::Char('y') if app.ui.focus == Focus::Conversation && !app.ui.has_modal() => {
-                                if let Err(error) = app.copy_selected(engine).await { app.ui.notice = format!("复制失败：{error:#}"); }
+                                if let Err(error) = app.copy_selected(engine).await { app.ui.fail(format!("复制失败：{error:#}")); }
                             },
-                            KeyCode::Char('r') if control && app.reconcile_call.is_some() => app.ui.notice = "先记录或取消核查；执行仍暂停".into(),
+                            KeyCode::Char('r') if control && app.reconcile_call.is_some() => app.ui.notify("先记录或取消核查；执行仍暂停"),
                             KeyCode::Char('r') if control => { resume(engine, &mut app.ui); deadline = Some(Instant::now()+duration); },
                             KeyCode::Char('p') if control => app.commands(engine, String::new()),
                             KeyCode::Char('o') if control => app.complete_file(engine),
                             KeyCode::Char('g') if control => {
-                                if let Err(error) = app.editor(engine, data, terminal, &mut input).await { app.ui.notice = format!("编辑失败：{error:#}"); }
+                                if let Err(error) = app.editor(engine, data, terminal, &mut input).await { app.ui.fail(format!("编辑失败：{error:#}")); }
                             },
                             KeyCode::Tab | KeyCode::Enter if app.ui.is_completion() && app.ui.picker_value().is_some()
                                 && !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL | KeyModifiers::SHIFT) => {
-                                if let Some((kind, value)) = app.ui.picker_value() { app.complete_inline(kind, &value); }
+                                if let Some((kind, value)) = app.ui.picker_value() {
+                                    if kind == PickerKind::Command && key.code == KeyCode::Enter {
+                                        match app.submit_command(engine, data, terminal, &mut input, &value).await {
+                                            Ok(true) => return Ok(()),
+                                            Ok(false) => {},
+                                            Err(error) => app.ui.fail(format!("操作失败：{error:#}；草稿已保留")),
+                                        }
+                                    } else { app.complete_inline(kind, &value); }
+                                }
                             },
                             KeyCode::Enter if app.ui.picker.is_some() && !app.ui.is_completion() => {
                                 if let Some((kind, value)) = app.ui.picker_value() {
@@ -2471,13 +2484,13 @@ async fn event_loop(
                                             Ok(false)
                                         },
                                     };
-                                    match result { Ok(true) => return Ok(()), Ok(false) => {}, Err(error) => app.ui.notice = format!("操作失败：{error:#}") }
+                                    match result { Ok(true) => return Ok(()), Ok(false) => {}, Err(error) => app.ui.fail(format!("操作失败：{error:#}"))}
                                 }
                             },
                             _ if app.ui.has_modal() => app.ui.handle_key(key),
                             KeyCode::Enter if app.reconcile_editor_active()
                                 && !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL | KeyModifiers::SHIFT) => {
-                                if let Err(error) = app.handle_reconcile_key(engine, key) { app.ui.notice = format!("记录失败：{error:#}；核查草稿保留"); }
+                                if let Err(error) = app.handle_reconcile_key(engine, key) { app.ui.fail(format!("记录失败：{error:#}；核查草稿保留")); }
                             },
                             KeyCode::Enter if !key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL | KeyModifiers::SHIFT) => {
                                 match app.ui.focus {
@@ -2487,13 +2500,11 @@ async fn event_loop(
                                             app.ui.close_completion();
                                             if text.trim_start().starts_with('/') {
                                                 // Keep an unknown command in the editor; do not turn it into agent input.
-                                                let command_draft = app.ui.draft_snapshot();
-                                                app.ui.take_draft();
-                                                let result = app.command(engine, data, terminal, &mut input, &text).await;
+                                                let result = app.submit_command(engine, data, terminal, &mut input, &text).await;
                                                 match result {
                                                     Ok(true) => return Ok(()),
                                                     Ok(false) => {},
-                                                    Err(error) => { app.ui.restore_draft(command_draft); app.ui.notice = format!("操作失败：{error:#}；草稿已保留"); },
+                                                    Err(error) => app.ui.fail(format!("操作失败：{error:#}；草稿已保留")),
                                                 }
                                             } else {
                                                 let posted = if let Some(target) = app.reply_target.as_deref() { engine.post(&text, Some(target)) } else { engine.post_message(&text) };
@@ -2504,10 +2515,10 @@ async fn event_loop(
                                                         if sent_target.is_some() { app.switch_target(None); }
                                                         app.last_input = Some(id.clone());
                                                         app.last_admitted_input = None;
-                                                        app.ui.notice = format!("输入 {} 已接收 · 等待纳入执行", short_id(&id));
+                                                        app.ui.notify("已收到 · 等待纳入执行");
                                                         app.elapsed_from = Instant::now(); deadline = Some(Instant::now()+duration);
                                                         app.refresh_sessions(engine, data); },
-                                                    Err(error) => app.ui.notice = format!("发送失败：{error:#}；草稿已保留"),
+                                                    Err(error) => app.ui.fail(format!("发送失败：{error:#}；草稿已保留")),
                                                 }
                                             }
                                         }
@@ -2516,7 +2527,7 @@ async fn event_loop(
                                         if let Some(id) = app.ui.selected_event().map(str::to_owned) {
                                             match engine.read_event(&id).and_then(|e| detail(engine, &e)) {
                                                 Ok(text) => { app.detail_event = Some(id.clone()); app.ui.open_detail(format!("行动原文 · {} · /audit 审计", short_id(&id)), text); app.remember_detail_source(); },
-                                                Err(error) => app.ui.notice = format!("读取记录失败：{error:#}"),
+                                                Err(error) => app.ui.fail(format!("读取记录失败：{error:#}")),
                                             }
                                         }
                                     },
@@ -2524,34 +2535,52 @@ async fn event_loop(
                                         let question = app.ui.selected_message().and_then(|m| m.event_id.as_deref())
                                             .filter(|id| engine.unanswered_questions().iter().any(|q| q.id == *id)).map(str::to_owned);
                                         if let Some(id) = question {
-                                            if let Err(error) = app.bind_reply(engine, &id) { app.ui.notice = format!("回复目标未切换：{error:#}"); }
+                                            if let Err(error) = app.bind_reply(engine, &id) { app.ui.fail(format!("回复目标未切换：{error:#}")); }
                                         } else { app.ui.toggle_selected_message(); }
                                     },
                                     Focus::Sessions => {
                                         if let Some(id) = app.ui.selected_session().map(str::to_owned)
                                             && let Err(error) = app.switch_session(engine, data, Some(&id)) {
-                                            app.ui.notice = format!("会话未切换：{error:#}");
+                                            app.ui.fail(format!("会话未切换：{error:#}"));
                                         }
                                     },
                                 }
                             },
                             _ => app.ui.handle_key(key),
                         }
+                        if key.modifiers.is_empty()
+                            && matches!(key.code, KeyCode::Up | KeyCode::Home | KeyCode::PageUp | KeyCode::Char('k'))
+                            && app.ui.focus == Focus::Conversation
+                            && app.ui.at_history_start() && app.older.is_some()
+                            && let Err(error) = app.load_older(engine, data) {
+                            app.ui.fail(format!("读取更早记录失败：{error:#}"));
+                        }
                         if key.code == KeyCode::Left && key.modifiers == KeyModifiers::SHIFT
                             && app.ui.focus == Focus::Sessions && !app.ui.has_modal() && !app.ui.show_activity {
                             app.refresh_sessions(engine, data);
                         }
                         app.refresh_search(engine, data);
-                        if let Err(error) = app.refresh_completion(engine, data) { app.ui.notice = format!("补全失败：{error:#}"); }
+                        if let Err(error) = app.refresh_completion(engine, data) { app.ui.fail(format!("补全失败：{error:#}")); }
                         app.changed_at = Some(Instant::now()); dirty = true;
                     },
-                    TerminalEvent::Paste(text) => { app.ui.handle_paste(&text); app.refresh_search(engine, data); app.refresh_completion(engine, data)?; app.changed_at = Some(Instant::now()); dirty = true; },
+                    TerminalEvent::Paste(text) => {
+                        if app.ui.notice_tone == Tone::Error && !app.ui.has_modal() && app.ui.focus == Focus::Input { app.ui.notify(""); }
+                        app.ui.handle_paste(&text); app.refresh_search(engine, data); app.refresh_completion(engine, data)?; app.changed_at = Some(Instant::now()); dirty = true;
+                    },
                     TerminalEvent::Mouse(mouse) => {
                         if let Some(id) = app.ui.clicked_session(mouse) {
                             if let Err(error) = app.switch_session(engine, data, Some(&id)) {
-                                app.ui.notice = format!("会话未切换：{error:#}");
+                                app.ui.fail(format!("会话未切换：{error:#}"));
                             }
-                        } else { app.ui.handle_mouse(mouse); }
+                        } else {
+                            app.ui.handle_mouse(mouse);
+                            if mouse.kind == crossterm::event::MouseEventKind::ScrollUp
+                                && app.ui.conversation_area.contains((mouse.column, mouse.row).into())
+                                && app.ui.at_history_top() && app.older.is_some()
+                                && let Err(error) = app.load_older(engine, data) {
+                                app.ui.fail(format!("读取更早记录失败：{error:#}"));
+                            }
+                        }
                         dirty = true;
                     },
                     TerminalEvent::Resize(..) => dirty = true,
@@ -2566,16 +2595,16 @@ async fn event_loop(
             _ = tokio::signal::ctrl_c() => { pause(engine,&mut app.ui)?; app.clear_preview(); deadline = None; app.sync(engine,data)?; dirty = true; },
             _ = tokio::time::sleep_until(deadline.unwrap_or_else(|| Instant::now()+duration)), if deadline.is_some() => {
                 pause(engine,&mut app.ui)?; app.clear_preview(); deadline = None;
-                app.ui.notice = "运行时限已到，已暂停；Ctrl+R 继续".into(); app.sync(engine,data)?; dirty = true;
+                app.ui.notify("运行时限已到，已暂停；Ctrl+R 继续"); app.sync(engine,data)?; dirty = true;
             },
-            _ = tick.tick(), if !engine.is_quiescent() || app.has_tasks() || app.changed_at.is_some() || app.notice_until.is_some() => {
+            _ = tick.tick(), if !engine.is_quiescent() || app.has_tasks() || app.changed_at.is_some() || app.ui.notice_until.is_some() => {
                 let pending = app.has_tasks();
                 app.tasks(engine, data).await;
-                let expired_notice = app.expire_notice();
+                let expired_notice = app.ui.expire_notice();
                 dirty |= app.progress(engine) || !engine.is_quiescent() || pending || expired_notice;
                 if app.changed_at.is_some_and(|at| at.elapsed() >= Duration::from_millis(500))
                     && let Err(error) = app.save(engine,data) {
-                    app.ui.notice = format!("草稿保存失败：{error:#}"); app.changed_at = None; dirty = true;
+                    app.ui.fail(format!("草稿保存失败：{error:#}")); app.changed_at = None; dirty = true;
                 }
             },
             _ = tokio::time::sleep_until(cooldown), if Instant::now() < cooldown => {},
@@ -2633,6 +2662,18 @@ fn execution_active(state: &bone::state::SessionState) -> bool {
         && state.jobs.values().any(|job| {
             job.state == JobState::Ready
                 || (job.state == JobState::Running && job.current_call.is_some())
+        })
+}
+
+fn has_unfinished_work(state: &bone::state::SessionState) -> bool {
+    !state.pending_inputs.is_empty()
+        || state.jobs.values().any(|job| {
+            job.state != JobState::Closed
+                && (job.state != JobState::Idle
+                    || job.current_call.is_some()
+                    || job.active_input.is_some()
+                    || !job.inbox.is_empty()
+                    || !job.wait_for.is_empty())
         })
 }
 
@@ -2696,7 +2737,7 @@ fn current_status(engine: &Engine, input: Option<&str>, tool_failure: Option<&st
     if !state.unknown_writes.is_empty() {
         return format!("需核查 {} 项写入 · /reconcile", state.unknown_writes.len());
     }
-    if state.paused {
+    if state.paused && has_unfinished_work(state) {
         return "已暂停 · Ctrl+R 恢复".into();
     }
     let active = state
@@ -2907,9 +2948,8 @@ fn tool_summary(engine: &Engine, event: &Event, body: &str) -> Result<String> {
             .map(|s| s.replace('\n', " ").chars().take(20).collect::<String>())
     });
     Ok(format!(
-        "{}{result} · {}",
+        "{}{result}",
         target.map(|t| format!("{t} · ")).unwrap_or_default(),
-        short_id(event.call_id.as_deref().unwrap_or(&event.id))
     ))
 }
 
@@ -3115,22 +3155,20 @@ fn ingest(engine: &Engine, event: &Event, ui: &mut View) -> Result<()> {
         || event.kind == "question"
         || (public && matches!(event.kind.as_str(), "delivery" | "failure" | "input_paused"))
     {
-        let role = if user {
-            "你 · 已接收"
+        let kind = if user {
+            MessageKind::User { admitted: false }
         } else if event.kind == "question" {
-            "Agent · 提问"
+            MessageKind::Question
         } else if event.kind == "failure" {
-            "执行失败"
+            MessageKind::Failure
+        } else if event.kind == "input_paused" {
+            MessageKind::Paused
         } else {
-            "Agent"
+            MessageKind::Delivery
         };
         ui.push_message(Message {
             summary: None,
-            role: if user {
-                format!("{role} · {}", short_id(&event.id))
-            } else {
-                role.into()
-            },
+            kind,
             text: body.clone(),
             event_id: Some(event.id.clone()),
         });
@@ -3141,7 +3179,7 @@ fn ingest(engine: &Engine, event: &Event, ui: &mut View) -> Result<()> {
         let input = engine.read_event(id)?;
         if input.data["source"] == "user" {
             ui.upsert_message(Message {
-                role: format!("你 · 已纳入 · {}", short_id(id)),
+                kind: MessageKind::User { admitted: true },
                 text: event_body(engine, &input)?,
                 event_id: Some(id.into()),
                 summary: None,
@@ -3172,14 +3210,20 @@ fn ingest(engine: &Engine, event: &Event, ui: &mut View) -> Result<()> {
             ""
         };
         let failed = tool_failed(engine, event)?;
-        let phase = if event.kind == "tool_started" {
-            "执行中"
+        let state = if event.kind == "tool_started" {
+            ToolState::Running
         } else if event.data["uncertain"] == true {
-            "结果未知 · 需核查 /reconcile"
+            ToolState::Unknown
         } else if failed {
-            "失败"
+            ToolState::Failed
         } else {
-            "完成"
+            ToolState::Completed
+        };
+        let phase = match state {
+            ToolState::Running => "执行中",
+            ToolState::Unknown => "结果未知 · 需核查 /reconcile",
+            ToolState::Failed => "失败",
+            ToolState::Completed => "完成",
         };
         let failure = if failed {
             Some(tool_failure_observation(engine, event, result)?)
@@ -3219,7 +3263,10 @@ fn ingest(engine: &Engine, event: &Event, ui: &mut View) -> Result<()> {
         };
         ui.upsert_message(Message {
             summary,
-            role: format!("工具 · {name}"),
+            kind: MessageKind::Tool {
+                name: name.into(),
+                state,
+            },
             text,
             event_id: Some(format!(
                 "tool:{}",
@@ -3238,7 +3285,7 @@ fn ingest(engine: &Engine, event: &Event, ui: &mut View) -> Result<()> {
         if !text.is_empty() {
             ui.push_message(Message {
                 summary: None,
-                role: "Agent · 进度".into(),
+                kind: MessageKind::Progress,
                 text,
                 event_id: Some(event.id.clone()),
             });

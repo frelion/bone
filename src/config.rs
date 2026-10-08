@@ -383,10 +383,11 @@ pub fn validate_profile_name(name: &str) -> Result<()> {
     ensure!(
         !name.is_empty()
             && name.len() <= 80
+            && name == name.trim()
             && name
                 .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
-        "profile names must contain 1–80 letters, digits, underscores or hyphens"
+                .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '_' | '-')),
+        "connection names support Unicode letters, digits, spaces, underscores or hyphens; no leading or trailing spaces, at most 80 UTF-8 bytes"
     );
     Ok(())
 }

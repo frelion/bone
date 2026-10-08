@@ -322,7 +322,7 @@ auth = "Bearer"
 
     def evidence(self, directory, name, error=None):
         directory.mkdir(parents=True, exist_ok=True)
-        document = {"scenario": name, "scope": "Real PTY; synthetic protocol fixture, no real model or personal credentials",
+        document = {"scenario": name, "scope": getattr(self,'scenario_scope',"Real PTY; synthetic protocol fixture, no real model or personal credentials"),
             "status": 'OBSERVED' if getattr(self,'observation_mode',False) else ("FAIL" if error else "PASS"), "error": str(error) if error else None,
             "binary": str(self.binary), "binary_sha256_at_start": self.binary_sha256, "max_parallel": self.max_parallel,
             "source_fingerprint_at_start": self.source_fingerprint, "source_fingerprint_at_end": production_fingerprint(),
@@ -456,7 +456,7 @@ def styled_frame(frame):
             if frame.get('cursor_visible') and frame.get('cursor') == [y,x]: css += ';outline:1px solid #f3f7ff;outline-offset:-1px'
             line.append('<span style="'+css+'">'+html.escape(text)+'</span>')
             x = end
-        result.append('<span style="display:flex;white-space:pre;font-family:monospace;line-height:1.35">'+''.join(line)+'</span>')
+        result.append('<span style="display:flex;white-space:pre;font-family:inherit;line-height:1.35">'+''.join(line)+'</span>')
     return ''.join(result)
 
 
@@ -793,7 +793,7 @@ def workspace_flow(f):
     f.wait(lambda:'保留回复!草稿_A' in f.screen(),'sidebar opens the original session')
     f.observed_session = original
     f.capture('Sidebar switches back to paused source: reply target and multiline draft remain')
-    check('reopened session retains its question target',any(d.get('draft')==edited and d.get('reply_to')==question['id'] for d in f.saved_drafts()) and f.visible('回复 '+question['id'][:8]))
+    check('reopened session retains its exact target and readable question',any(d.get('draft')==edited and d.get('reply_to')==question['id'] for d in f.saved_drafts()) and f.visible('回复：WORKSPACE_REPLY_QUESTION'))
     f.send(b'\x1b[1;2D\x1b[F\r')
     f.wait(lambda:'API_A_ROUTE_CONFIRMED' in f.screen(),'sidebar returns to second session')
     f.observed_session = second
@@ -825,7 +825,7 @@ def workspace_flow(f):
     f.send(key+'\r')
     f.wait(lambda:config_string('','default_profile')=='fixture_b','API B is durable default')
     f.capture('API B saved without any model probe; first Job must verify authentication')
-    check('connection save makes no hidden model request',len(f.calls())==before and f.visible('首次请求验证认证'))
+    check('connection save makes no hidden model request or empty resumption',len(f.calls())==before and config_string('','default_profile')=='fixture_b' and f.visible('下次请求使用新模型') and not f.visible('Ctrl+R'))
     check('parent editor draft survives successful connection form',any(d.get('draft')=='FORM_DRAFT_PRESERVED' for d in f.saved_drafts()))
     f.send(b'\x01\x0b\x12')
     body('WORKSPACE_API_B','api_b','arbitrary-org/model:v2')
@@ -977,7 +977,7 @@ def sidebar_flow(f):
     f.send(b'\x1b[H\x1b[B')
     f.pump(.15)
     f.capture('Candidate 01 remains distinct from current 00 while a real response is pending')
-    check('current identity survives long-title truncation',any('当前' in line for line in sidebar_lines()))
+    check('current identity survives long-title truncation',any('•' in line for line in sidebar_lines()))
     candidate_row, current_row = locate('任务01'), locate('任务00')
     selected_rows = {run['row'] for run in f.cell_styles if 'reverse' in run['attributes']}
     check('candidate highlight is separate from current identity',candidate_row in selected_rows and current_row not in selected_rows,
@@ -1007,11 +1007,11 @@ def sidebar_flow(f):
     f.send(b'\x1b[1;2D\x1b[H')
     f.wait(lambda:locate('任务03') is not None,'candidate 03 is visible')
     row = locate('任务03')
-    click(row+1)
+    click(row)
     verify_session(seeded[3])
     f.observed_session = seeded[3]
-    check('clicking metadata opens its real session and pauses the previous one',f.state(seeded[2])['paused'] and len(f.calls())==1)
-    f.capture('Single click on metadata opens exact session 03')
+    check('clicking another compact row opens its real session and pauses the previous one',f.state(seeded[2])['paused'] and len(f.calls())==1)
+    f.capture('Single click on a compact session row opens exact session 03')
     f.send('窄屏草稿保持')
     f.wait(lambda:any(d.get('draft')=='窄屏草稿保持' for d in f.saved_drafts()),'narrow-screen parent draft saved')
     original_size = (f.rows,f.cols)
@@ -1033,6 +1033,171 @@ def sidebar_flow(f):
     f.resize(*original_size)
     f.pump(.2)
     f.capture('Escape after resizing restores the original editing draft without submission')
+    f.quit()
+
+
+def product_flow(f):
+    """Natural whole-product journey, with authored sidebar data clearly separate from real Job calls."""
+    f.scenario_scope = "Installed or candidate binary in a real PTY; actual Engine/Job calls to authored localhost Responses. The 32 sidebar conversations are mechanical state/title fixtures, not completed model tasks. No remote model or personal credentials."
+    f.acceptance_checks = []
+    def check(name, passed, observed=None):
+        f.acceptance_checks.append({'name':name,'passed':bool(passed),'observed':observed})
+        assert passed, name
+    def menu(query):
+        f.send(b'\x10'); f.pump(.12); f.send(query+'\r'); f.pump(.18)
+    def clear():
+        # Only the fixture's known one/two-line draft is cleared; production has no select-all shortcut.
+        for _ in range(4): f.send(b'\x01\x0b\x7f')
+        f.pump(.1)
+    def saved(session):
+        path = f.data/'tui'/(session+'.json')
+        return json.loads(path.read_text()) if path.exists() else {}
+    def main_has(text):
+        f.screen()
+        width=max(26,min(32,f.cols//4)) if f.cols>=80 else 0
+        body='\n'.join(''.join(row[width:]) for row in f.terminal_cells)
+        return re.sub(r'\s+','',text) in re.sub(r'\s+','',body)
+    original = f.state()['id']
+    f.observed_session = original
+    titles = [
+        ('收紧 OAuth 回调验证','question'), ('账单迁移 · 回滚前核查','unknown'),
+        ('解释跨域请求为什么失败','idle'), ('修复桌面端输入法组合','paused'),
+        ('给导入器补取消入口','ready'), ('阅读 PR 中重复的重试','waiting'),
+        ('补齐 Linux 路径转义，保留旧参数兼容 · 终端输入','idle'),
+        ('Refactor URL parser without changing public behavior','idle'),
+        ('给分页查询添加稳定排序','idle'), ('修正中文搜索结果高亮','idle'),
+        ('检查缓存失效边界','paused'), ('更新发布说明','idle'),
+        ('保留登录后的跳转地址','question'), ('清理构建产物','idle'),
+        ('对照新的错误码解释失败原因','idle'), ('调整窄屏表单','idle'),
+        ('迁移用户偏好设置','idle'), ('复查工作区锁冲突','unknown'),
+        ('追踪一次慢请求','idle'), ('阅读上传接口的调用关系','idle'),
+        ('修复输入历史中的多行光标','idle'), ('让快捷键提示与实际动作一致','idle'),
+        ('删除已经失效的兼容层','idle'), ('定位后台任务重复启动','paused'),
+        ('确认代码修改没有覆盖另一任务','idle'), ('解释一次失败的编译','idle'),
+        ('收缩模型配置边界','idle'), ('改善工具日志中的长路径','idle'),
+        ('对比新旧索引结果','idle'), ('完善会话恢复说明','idle'),
+        ('检查 Windows 换行符','idle'), ('梳理接入另一个 provider 的步骤','idle'),
+    ]
+    # These are mechanical conversation fixtures, never claimed as 32 completed model tasks.
+    template = f.state(original)
+    with closing(sqlite3.connect(f.data/'sessions.sqlite3')) as connection:
+        for index, (title, attention) in reversed(list(enumerate(titles))):
+            session, job, event, call = (str(uuid.uuid4()) for _ in range(4))
+            snapshot = copy.deepcopy(template)
+            snapshot.update(id=session,focus=job,revision=1,pending_inputs=[],paused=attention in ('paused','unknown'),budgets={},unknown_writes={},jobs={job:{
+                'id':job,'title':'Conversation','state':{'question':'Waiting','waiting':'Waiting','ready':'Ready','paused':'Ready'}.get(attention,'Idle'),
+                'inbox':[],'active_input':None,'history':[event],'summary':None,
+                'wait_for':['fixture-dependency'] if attention=='waiting' else [],'current_call':None,'public_revision':1}})
+            if attention=='unknown': snapshot['unknown_writes']={call:{'call_id':call,'job_id':job,'root_input':event,'tool_name':'shell'}}
+            user={'id':event,'session_id':session,'job_id':job,'call_id':None,'reply_to':None,'root_input':event,'kind':'input','revision':1,
+                'data':{'source':'user','message':{'role':'user','content':[{'type':'text','text':title}]}},'timestamp':str(int(time.time()*1000)-index*60000)}
+            metadata=copy.deepcopy(user);metadata['data'].pop('message')
+            connection.execute('INSERT INTO sessions(id,revision,snapshot) VALUES(?,?,?)',(session,1,json.dumps(snapshot)))
+            connection.execute('INSERT INTO events(id,session_id,revision,payload,job_id,metadata) VALUES(?,?,?,?,?,?)',(event,session,1,json.dumps(user),job,json.dumps(metadata)))
+            if attention=='question':
+                question=copy.deepcopy(user);question.update(id=str(uuid.uuid4()),kind='question',call_id=call,reply_to=event,
+                    data={'question':'是否保留现有跳转行为？','tool_key':call+'-key'})
+                connection.execute('INSERT INTO events(id,session_id,revision,payload,job_id,metadata) VALUES(?,?,?,?,?,?)',
+                    (question['id'],session,1,json.dumps(question),job,json.dumps(question)))
+        connection.commit()
+    f.send(b'\x1b[1;2D');f.wait(lambda:f.visible('收紧 OAuth'),'mixed authored sidebar index');f.send(b'\x1b[H\x1b[B');f.capture('Real terminal: browse candidate, current session and mixed attention states')
+    check('mixed titles expose distinct required attention words',all(f.visible(word) for word in ('核查','回复','暂停')))
+    width=(f.cols//4 if f.cols>=80 else 0);width=max(26,min(32,width)) if width else f.cols
+    sidebar=[''.join(row[:width]) for row in f.terminal_cells]
+    current_row=next((row for row,line in enumerate(sidebar) if '•' in line and '新会话' in line),None)
+    candidate_row=next((row for row,line in enumerate(sidebar) if '收紧 OAuth' in line),None)
+    highlighted={run['row'] for run in f.cell_styles if 'reverse' in run['attributes'] and run['start']<width}
+    check('current identity and browsed candidate remain different without color',current_row is not None and candidate_row in highlighted and current_row not in highlighted,
+        {'current_row':current_row,'candidate_row':candidate_row,'highlighted_rows':sorted(highlighted)})
+    check('authored sidebar list remains a session list',len(f.session_states())==33 and not f.calls())
+    f.send(b'\x1b[1;2B');f.send('修复登录重定向：保持兼容行为，先确认失败回调的处理方式。\r')
+    f.wait(lambda:len(f.calls())==1,'one actual local model request starts');f.capture('Actual Job: thinking without invented completed tasks')
+    f.wait(lambda:any(e['kind']=='question' for e in f.events(original)),'actual question from a Job')
+    question=next(e for e in f.events(original) if e['kind']=='question')
+    new_draft='保持兼容行为。\n另外保留现有 cookie 名称。'
+    f.send('\x1b[200~'+new_draft+'\x1b[201~')
+    f.wait(lambda:saved(original).get('draft')==new_draft,'new requirement draft durable')
+    menu('回复问题');f.send('\r');f.pump(.12)
+    answer='保持原地址，并覆盖回归测试草稿'
+    f.send(answer);f.send(b'\x1b[1;6D\x1b[1;6D\x19')
+    f.wait(lambda:f.clipboard.exists() and f.clipboard.read_text()=='草稿','answer selection copies exact Chinese text')
+    f.wait(lambda:saved(original).get('draft')==answer and saved(original).get('reply_to')==question['id'],'targeted answer durable')
+    position=(saved(original).get('cursor'),saved(original).get('selection'))
+    f.capture('Actual question: its selected answer and the separate unsent requirement')
+    menu('new');f.wait(lambda:len(f.session_states())==34,'second real session created')
+    # The new session is the only non-authored session without an input event.
+    second=next(s for s in f.session_states() if s!=original and not f.events(s))
+    f.observed_session=second
+    f.send(b'\x1b[1;2D\x1b[H\x1b[B\r');f.pump(.25);f.send(b'\x1b[1;2B')
+    f.wait(lambda:f.visible(answer),'source answer restores after session switch');f.observed_session=original
+    check('session switch keeps answer target, caret and selection',saved(original).get('reply_to')==question['id'] and position==(saved(original).get('cursor'),saved(original).get('selection')))
+    f.quit();f.restart(original);f.pump(.2);f.capture('Restart restores the actual targeted answer')
+    f.clipboard.unlink();f.send(b'\x19');f.wait(lambda:f.clipboard.exists() and f.clipboard.read_text()=='草稿','restart restores exact input selection')
+    menu('写新要求');f.wait(lambda:saved(original).get('draft')==new_draft,'inactive new requirement restores after switch and restart')
+    check('all existing target drafts survive session switch and process restart',saved(original).get('draft')==new_draft)
+    f.capture('Separate new requirement remains intact after returning from a question and restart')
+    clear();f.send('/mo');f.pump(.15);f.send(b'\t');f.pump(.15)
+    check('Tab completes a slash candidate without execution',f.visible('/model') and not f.visible('模型名称 · 服务商'))
+    clear();f.send('/mo');f.pump(.15);f.send('\r');f.wait(lambda:f.visible('模型名称 · 服务商'),'Enter directly executes selected slash command')
+    check('slash Enter opens its selected action in one step',f.visible('模型名称 · 服务商') and len(f.calls())==1)
+    f.capture('Slash Enter directly opens model editing; parent input stays separate')
+    f.send(b'\x1b');f.pump(.12);clear();f.send('点击编辑草稿');f.pump(.2);f.send(b'\x1b[1;2A');f.pump(.15)
+    rows=f.screen().splitlines();row=next(index for index,line in enumerate(rows) if '点击编辑草稿' in line)
+    f.send(f'\x1b[<0;{f.cols-8};{row+1}M\x1b[<0;{f.cols-8};{row+1}m');f.pump(.12);f.send('!')
+    f.wait(lambda:saved(original).get('draft')=='点击编辑草稿!','clicking composer restores input focus without sending')
+    f.capture('Clicking the visible composer permits editing without sending')
+    check('click input edits only the draft',len(f.calls())==1 and f.visible('点击编辑草稿!'))
+    clear();f.send('/not-a-real-command\r');f.wait(lambda:f.visible('未知命令'),'unknown command failure visible')
+    f.capture('A real local command error keeps its draft and readable cause')
+    f.pump(8.8);f.capture('Failure remains visible after the old eight-second expiry window')
+    check('action failure remains until correction, rather than expiring',f.visible('未知命令') and f.visible('/not-a-real-command') and len(f.calls())==1)
+    clear()
+    menu('connect');f.wait(lambda:f.visible('添加 API 连接'),'connection chooser');f.send('添加\r')
+    f.wait(lambda:f.visible('API 模型'),'native provider picker');f.send('openai API 模型\r')
+    f.wait(lambda:f.visible('› 连接名称'),'API native form')
+    for value,next_label in zip(('team_api','fixture-v2',f.api_a_url),('模型名称','API endpoint','API key')):
+        f.send(b'\x01\x0b');f.send(value+'\r')
+        f.wait(lambda:f.visible('› '+next_label) and bool(f.screen()) and f.cursor_visible,'next visible native form field: '+next_label)
+    secret='synthetic-local-only-no-reuse-91557'
+    f.send(secret);f.pump(.2);f.capture('Before saving: connection, model and endpoint remain visible beside a masked API key')
+    check('final API step allows checking the actual connection before saving',all(f.visible(value) for value in ('team_api','fixture-v2',f.api_a_url)))
+    check('API key does not enter terminal text or conversation',secret not in f.output.decode(errors='replace') and secret not in json.dumps(f.events()))
+    # The parent draft is empty here. A former wide caret must not leave a
+    # reversed trailing cell that looks like a second caret behind the form.
+    main_start=max(26,min(32,f.cols//4)) if f.cols>=80 else 0
+    main_rows=[''.join(row[main_start:]) for row in f.terminal_cells]
+    draft_top=next(row for row,line in enumerate(main_rows) if '┌ 草稿 ' in line)
+    draft_bottom=next(row for row in range(draft_top+1,len(main_rows)) if main_rows[row].startswith('└'))
+    reversed_parent=[run for run in f.cell_styles if draft_top<run['row']<draft_bottom
+        and run['start']>=main_start and 'reverse' in run['attributes']]
+    check('inactive empty parent draft has no second reversed caret behind the API form',not reversed_parent,
+        {'draft_rows':[draft_top+1,draft_bottom-1],'reverse_runs':reversed_parent})
+    f.send(b'\x1b');f.pump(.12)
+    # History runs in the existing empty B. A intentionally still owns an
+    # unanswered work input; using A would also require scripting its resumption.
+    f.send(b'\x1b[1;2D\x1b[H\x1b[B\r');f.pump(.25);f.send(b'\x1b[1;2B')
+    f.observed_session=second
+    original_ui=json.dumps(saved(original),ensure_ascii=False)
+    check('separate history work leaves original question and its answer draft paused',f.state(original)['paused'] and answer in original_ui and question['id'] in original_ui)
+    for index in range(12):
+        marker='历史回归 '+str(index).zfill(2)+'：复查登录边界，保留会话约束。'
+        f.send(marker+'\r')
+        def delivered():
+            events=f.events(second)
+            inputs={e['id'] for e in events if e['kind']=='input' and marker in json.dumps(e.get('data',{}),ensure_ascii=False)}
+            return any(e['kind']=='delivery' and e.get('reply_to') in inputs for e in events)
+        f.wait(delivered,'actual local history turn '+str(index))
+    f.quit();f.restart(second);f.pump(.2);f.capture('Twelve real local turns: reopening starts with a bounded recent window')
+    state=f.state(second)
+    check('completed Idle session keeps its core pause flag without offering empty resumption',state['paused'] and all(job['state']=='Idle' for job in state['jobs'].values())
+        and not main_has('Ctrl+R') and not main_has('已暂停') and len(f.calls())==13)
+    f.send(b'\x1b[1;2A')
+    for _ in range(8):
+        f.send(b'\x1b[H');f.pump(.15)
+        if main_has('历史回归 00'): break
+    f.capture('Natural reading reaches earlier persistent history without a hidden slash command')
+    check('reading at the top loads older persisted conversation',main_has('历史回归 00'))
+    check('navigation and historical loading make no new model requests',len(f.calls())==13,{'requests':len(f.calls()),'events':len(f.events(second))})
     f.quit()
 
 
@@ -1229,10 +1394,10 @@ def slash_inline(f):
     f.send('he')
     f.wait(lambda: '/help' in f.screen(), 'slash candidates filter')
     f.send('\r')
-    f.wait(lambda: any(d.get('draft', '').strip() == '/help' for d in f.saved_drafts()), 'Enter selects candidate into draft only')
-    assert not f.calls() and not any(e.get('kind') == 'input' for e in f.events()), 'candidate Enter executed work'
-    assert '直接输入任务，Enter 发送' not in f.screen(), 'candidate Enter opened help instead of inserting it'
-    f.capture('Candidate Enter inserts /help without opening it')
+    f.wait(lambda: f.visible('帮助') and f.visible('Shift'), 'Enter directly executes selected help action')
+    assert not f.calls() and not any(e.get('kind') == 'input' for e in f.events()), 'help reached model'
+    f.capture('Candidate Enter opens help in one step without model work')
+    f.send(b'\x1b');f.pump(.12)
     f.send(b'\x01\x0b')
     f.send('/he')
     f.send('\t')
@@ -1241,7 +1406,7 @@ def slash_inline(f):
     f.wait(lambda: any(d.get('draft', '').strip() == '/help' for d in f.saved_drafts()), 'Tab retains completed command draft')
     f.capture("Tab inserts /help; no model request")
     f.send('\r')
-    f.wait(lambda:'直接输入任务，Enter 发送' in f.screen(),'completed public help command opens its reader')
+    f.wait(lambda:f.visible('帮助') and f.visible('Shift'),'completed public help command opens its reader')
     assert not f.calls() and not any(e.get('kind') == 'input' for e in f.events()), 'help reached model'
     f.capture("Help opens through the completed public command")
     f.send(b'\x1b')
@@ -1564,7 +1729,7 @@ def reconcile_keeps_reply_target(f):
     expected = 'ANSWER_!FIRST_LINE\nANSWER_SECOND_LINE'
     f.wait(lambda: any(d.get('draft') == expected for d in f.saved_drafts()), 'cancel restores reply draft at original insertion cursor')
     assert any(d.get('draft')==expected and d.get('reply_to')==question['id'] for d in f.saved_drafts()), 'reconciliation cancel lost the saved specific reply target'
-    assert '回复 '+question['id'][:8] in f.screen(), 'specific reply target is not visible after reconciliation cancel'
+    assert f.visible('回复：'+question['data']['question']), 'readable reply question is not visible after reconciliation cancel'
     assert len(f.calls()) == count, 'read or cancel replayed model work'
     assert len([e for e in f.events() if e['kind'] == 'input']) == before, 'reconciliation cancel submitted reply draft'
     assert f.state().get('paused') and f.state().get('unknown_writes'), 'reconciliation cancel changed execution state'
@@ -1584,7 +1749,7 @@ def exit_resume(f):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', type=Path, default=ROOT / 'target/debug/bone')
-    parser.add_argument('--case', choices=['paste','concurrent','pause','question','failure','stream','stale','stream-stop','commands','completion','sessions','signal','unicode','interactive-editor','editor-signal','slash-inline','multiline-undo','shell-live','exit-resume','reading-detail','persistent-search','question-target','question-independent','reader-delivery','tool-density','reconcile-reply','feedback-flow','workspace-flow','sidebar-flow'])
+    parser.add_argument('--case', choices=['paste','concurrent','pause','question','failure','stream','stale','stream-stop','commands','completion','sessions','signal','unicode','interactive-editor','editor-signal','slash-inline','multiline-undo','shell-live','exit-resume','reading-detail','persistent-search','question-target','question-independent','reader-delivery','tool-density','reconcile-reply','feedback-flow','workspace-flow','sidebar-flow','product-flow'])
     parser.add_argument("--evidence-dir", type=Path)
     parser.add_argument('--size', default='80x24', choices=['80x24', '120x40'], help='real terminal columns x rows')
     parser.add_argument('--keep-going', action='store_true', help='record every selected scenario, then fail if any failed')
@@ -1592,6 +1757,11 @@ def main():
     args = parser.parse_args()
     verify_vt_replay()
     cases = [
+        ('product-flow', [{'delay_seconds':1.8,'output':[tool('ask_user',{'question':'失败回调是否继续返回原地址？'})]}]+[
+            {'match_last_user_contains':'历史回归 '+str(index).zfill(2),'text':
+                '第 '+str(index).zfill(2)+' 轮复查结果\n\n'
+                '保留现有 cookie 名称；失败回调仍返回原地址。\n'
+                '- 增加过期状态回归。\n- 下一轮检查请求取消边界。'} for index in range(12)],product_flow),
         ('sidebar-flow', [{'contains':['SIDEBAR_REFRESH'],'delay_seconds':4,'text':'SIDEBAR_BACKGROUND_DELIVERED'}],sidebar_flow),
         ('workspace-flow', {'api_a':[
             {'match_job_title':'Conversation','contains':['WORKSPACE_SESSION_A'],'output':[tool('job_send',{'title':'NOT_A_SESSION_JOB','message':'Prove jobs are not sessions.'})]},

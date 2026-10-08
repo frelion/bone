@@ -29,7 +29,7 @@ bone --version
 bone providers
 ```
 
-安装后的版本应为 `bone 0.8.1`。如果仍显示旧版，用 `command -v bone` 检查实际入口；其他目录中更靠前的旧 launcher 会遮住 `~/.cargo/bin/bone`。可以先用 `~/.cargo/bin/bone tui` 启动，或将原 launcher 备份后指向这个安装位置。
+安装后的版本应为 `bone 0.9.0`。如果仍显示旧版，用 `command -v bone` 检查实际入口；其他目录中更靠前的旧 launcher 会遮住 `~/.cargo/bin/bone`。可以先用 `~/.cargo/bin/bone tui` 启动，或将原 launcher 备份后指向这个安装位置。
 
 `target/release/bone` 是构建目录内的文件，只有在包含它的 checkout 中才能通过相对路径运行。安装后的 `bone` 可在任意项目目录中使用。
 
@@ -127,9 +127,9 @@ TUI 左侧切换会话，右侧显示对话、Markdown 答复和工具行动；�
 
 默认正文不显示“你 / Agent”标题，原话以细竖线区分。输入框显示编辑焦点和真实终端光标。运行行固定显示实际动作、耗时与活动标记；输入回执独立显示，后台仍在执行时不会被较早的交付覆盖。
 
-0.8.1 使用 Shift+方向键切换焦点，左栏按标题与状态/时间两行呈现，后台刷新保持浏览选择；文本选区使用 Ctrl+Shift+方向键。
+0.9.0 使用 Shift+方向键切换焦点。左栏一项一行，当前会话与浏览候选分开；表单按内容收紧，保存前回顾公开配置，密钥遮罩。文本选区使用 Ctrl+Shift+方向键，点击输入框恢复编辑。
 
-本轮左栏实际终端证据见 [0.8.1](docs/results/2026-10-03-tui-sidebar/overview.html)；此前会话栏、连接管理与终端证据见 [0.8.0 工作区交互](docs/results/2026-10-03-tui-workspace/README.md)；此前反馈修复见 [0.7.1](docs/results/2026-10-02-tui-feedback/README.md)。
+本轮视觉对抗、架构减法与完整交互证据见 [0.9.0](docs/results/2026-10-03-product-refactor/overview.html)；此前左栏见 [0.8.1](docs/results/2026-10-03-tui-sidebar/overview.html)；此前会话栏、连接管理与终端证据见 [0.8.0 工作区交互](docs/results/2026-10-03-tui-workspace/README.md)；此前反馈修复见 [0.7.1](docs/results/2026-10-02-tui-feedback/README.md)。
 
 | 操作 | 按键 / 命令 |
 | --- | --- |
@@ -143,11 +143,11 @@ TUI 左侧切换会话，右侧显示对话、Markdown 答复和工具行动；�
 | 新会话 / 模型 / 连接 | `/new` / `/model` / `/connect` |
 | 项目修改 / 复制 / 帮助 | Ctrl+D / Ctrl+Y / F1 或 `/help` |
 
-草稿及最近输入独立、原子保存在数据目录的 `tui/` 下。多行粘贴、文件补全、恢复草稿和外部编辑器均不自动提交。切换会话保存并暂停旧工作，打开的未完成工作保持暂停。连接和模型保存到配置；API key 单独存放且绑定 endpoint，聊天记录不保存它。设置不做 Job 外的模型探活；首次实际请求验证认证。
+所有回复目标的未发送草稿、光标、选区及最近输入原子保存在数据目录的 `tui/` 下，切换和重启后恢复；撤销历史不跨进程保存。多行粘贴、文件补全、恢复草稿和外部编辑器均不自动提交。切换会话保存并暂停旧工作，打开的未完成工作保持暂停。连接和模型保存到配置；API key 单独存放且绑定 endpoint，聊天记录不保存它。设置不做 Job 外的模型探活；首次实际请求验证认证。
 
-界面支持中文/emoji/组合字符、鼠标滚动、Markdown/code/diff 和 NO_COLOR。F2 按需打开全宽内部事件面板。启动按页读取最近 40 条记录，`/older` 向前浏览；完整历史留在 SQLite。最近预览有明确数量和字符上限。模型预览允许丢帧，不承担持久化或交付职责；工具运行时显示 stdout/stderr 短尾部，完成后以持久原文为准。普通成功工具收成一行，失败先显示退出码与关键原因。
+界面支持中文/emoji/组合字符、鼠标滚动、Markdown/code/diff 和 NO_COLOR。F2 按需打开全宽内部事件面板。启动按页读取最近 40 条记录，上翻至顶部自动读取更早记录；完整历史留在 SQLite。最近预览有明确数量和字符上限。模型预览允许丢帧，不承担持久化或交付职责；工具运行时显示 stdout/stderr 短尾部，完成后以持久原文为准。普通成功工具收成一行，失败先显示退出码与关键原因。
 
-`/diff` 检查 staged/unstaged 修改及未跟踪文件实际内容；`/export` 导出本地 HTML 对话与行动日志；`/copy` 使用系统剪贴板。用户的界面操作不发起 Agent 模型或工作区写工具。Agent 的行动始终由 Engine/Job 执行；未知写必须先核查，TUI `/reconcile` 记录结论后仍暂停；Ctrl+R 才继续。TUI 需要交互终端，管道输入使用 `bone chat`。
+`/diff` 检查 staged/unstaged 修改及未跟踪文件实际内容；`/export` 异步导出本地 HTML 对话与行动日志，完成后 Ctrl+P 查看路径；`/copy` 使用系统剪贴板。用户的界面操作不发起 Agent 模型或工作区写工具。Agent 的行动始终由 Engine/Job 执行；未知写必须先核查，TUI `/reconcile` 记录结论后仍暂停；Ctrl+R 才继续。TUI 需要交互终端，管道输入使用 `bone chat`。
 
 问题到达只提醒；选中问题按 Enter 或通过 Ctrl+P 明确选择回复；菜单“写新要求”返回原稿。Esc 返回上一层，保留目标与草稿；Ctrl+C 始终暂停，Ctrl+Y 独立复制。
 

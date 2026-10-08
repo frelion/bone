@@ -9,6 +9,7 @@ fn drafts_roundtrip_and_reject_corruption_and_paths() {
         reply_to: Some("question-id".into()),
         cursor: Some(3),
         selection: Some((0, 3)),
+        ..Default::default()
     };
     save(dir.path(), "session", &saved).unwrap();
     assert_eq!(load(dir.path(), "session").unwrap().history, saved.history);
@@ -184,4 +185,36 @@ fn file_index_ignores_generated_hidden_and_symlinks() {
     #[cfg(unix)]
     std::os::unix::fs::symlink(dir.path(), dir.path().join("loop")).unwrap();
     assert_eq!(files(dir.path()).unwrap(), vec!["main.rs"]);
+}
+
+#[test]
+fn saved_drafts_are_backward_compatible_and_bounded_without_overwriting_good_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = session_path(dir.path(), "session").unwrap();
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, r#"{"draft":"legacy draft","history":[]}"#).unwrap();
+    let mut saved = load(dir.path(), "session").unwrap();
+    assert!(saved.drafts.is_empty());
+    saved.drafts.insert(
+        "".into(),
+        SavedDraft {
+            text: "original unsent request".into(),
+            cursor: 8,
+            selection: Some((0, 8)),
+        },
+    );
+    save(dir.path(), "session", &saved).unwrap();
+    assert_eq!(load(dir.path(), "session").unwrap(), saved);
+    let before = fs::read(&path).unwrap();
+    for i in 0..9 {
+        saved.drafts.insert(
+            format!("question-{i}"),
+            SavedDraft {
+                text: "x".repeat(DRAFT_LIMIT),
+                ..Default::default()
+            },
+        );
+    }
+    assert!(save(dir.path(), "session", &saved).is_err());
+    assert_eq!(fs::read(&path).unwrap(), before);
 }

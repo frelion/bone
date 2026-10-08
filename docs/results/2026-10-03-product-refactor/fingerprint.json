@@ -1,0 +1,9 @@
+{
+  "version": "bone 0.9.0",
+  "verified_date": "2026-10-08",
+  "binary": "/Users/zzhang/.cargo/bin/bone",
+  "binary_sha256": "4a10173576f6d81e374cc092e7b5c9ee65ec15e569af168ebbacb7c82e859662",
+  "source_fingerprint": "4c1f5d81ba32b9ddd53e791cf67c0d5907be93e335311005a3743a2a1aa73dd9",
+  "source_fingerprint_scope": "Sorted relative POSIX Cargo.toml, Cargo.lock, src/**/*.rs; path+NUL+bytes+NUL",
+  "harness_sha256": "a672be290b41a3f0fe1a65bfec364abf51294401e8779c94242e844566e58a7d"
+}
